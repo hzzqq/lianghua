@@ -1,0 +1,14 @@
+# 敏感凭证（企业微信自建应用 secret 等）——勿提交
+wecom_config.json
+
+# 运行时生成的状态/账本文件
+live_orders.db
+live_cron_state.json
+rebalance_log.json
+data_cache.db
+*.pyc
+__pycache__/
+*.pyc
+__pycache__/
+.pytest_cache/
+.workbuddy/
