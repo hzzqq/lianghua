@@ -1,0 +1,184 @@
+"""自研轻量回测引擎（纯 Pandas，零重依赖）。
+
+设计参考 qtrader 的事件流：信号 -> 组合/风控审核 -> 撮合 -> 记账。
+默认在信号日收盘价附近撮合（含滑点），支持佣金 + 印花税 + 风控拦截。
+如需与 Backtrader 复用，见 backtrader_adapter.py。
+
+v2 改进：
+- 成本统一走 _quote()，修复启用 CostModel 时滑点被重复计入（fill 已含滑点，
+  cost_for 又计一次）的隐性错误；无 CostModel 时回退到引擎简化成本。
+- _buy 资金约束保证 cost <= cash，且不再记录零股交易。
+- BacktestResult 新增 stats()：总收益、交易次数、最大回撤等可观测指标。
+- to_frame / stats 对缺列、空序列更稳健。
+"""
+from __future__ import annotations
+
+import pandas as pd
+
+from ..perf.metrics import max_drawdown
+from ..risk.cost import CostModel
+from ..risk.manager import RiskManager
+
+_LOT = 100
+
+
+class BacktestResult:
+    """回测结果容器。"""
+
+    def __init__(self, equity: pd.Series, trades: list[dict], signals: pd.Series, df: pd.DataFrame):
+        self.equity = equity
+        self.trades = trades
+        self.signals = signals
+        self.df = df
+
+    def to_frame(self) -> pd.DataFrame:
+        out = pd.DataFrame(index=self.equity.index)
+        if self.df is not None and "date" in self.df.columns:
+            out["date"] = self.df["date"].values[: len(self.equity)]
+        out["equity"] = self.equity.values
+        if self.df is not None and "close" in self.df.columns:
+            out["close"] = self.df["close"].values[: len(self.equity)]
+        return out
+
+    def stats(self) -> dict:
+        """汇总回测绩效指标，便于审计与对比。"""
+        eq = self.equity
+        if eq is None or len(eq) == 0:
+            return {"total_return": 0.0, "n_trades": len(self.trades),
+                    "max_drawdown": 0.0, "final_equity": 0.0}
+        start = float(eq.iloc[0])
+        end = float(eq.iloc[-1])
+        total_return = (end - start) / start if start != 0 else 0.0
+        return {
+            "total_return": total_return,
+            "n_trades": len(self.trades),
+            "max_drawdown": max_drawdown(eq),
+            "final_equity": end,
+        }
+
+
+class BacktestEngine:
+    """事件驱动风格的逐日回测引擎。"""
+
+    def __init__(
+        self,
+        init_cash: float = 1_000_000.0,
+        commission: float = 0.0003,   # 万三
+        slippage: float = 0.001,      # 千一
+        tax: float = 0.001,           # 千一印花税（卖出）
+        risk: RiskManager | None = None,
+        cost: "CostModel | None" = None,
+    ):
+        self.init_cash = init_cash
+        self.commission = commission
+        self.slippage = slippage
+        self.tax = tax
+        self.risk = risk or RiskManager()
+        self.cost = cost
+        self.trades: list[dict] = []
+
+    # ---------- 报价（成交价 + 费用 + 税），杜绝滑点重复计入 ----------
+    def _quote(self, price: float, qty: int, side: str):
+        cm = self.cost
+        if cm:
+            fill = cm.fill_price(price, side)
+            notional = abs(fill * qty)
+            comm = notional * cm.commission_rate + cm.fixed_fee
+            imp = notional * cm.impact
+            fee = max(comm + imp, cm.min_fee)
+            tax = notional * cm.stamp_tax if side in ("SELL", "SHORT", "COVER") else 0.0
+        else:
+            if side == "BUY":
+                fill = price * (1 + self.slippage)
+                fee = abs(fill * qty) * self.commission
+                tax = 0.0
+            else:
+                fill = price * (1 - self.slippage)
+                fee = abs(fill * qty) * self.commission
+                tax = abs(fill * qty) * self.tax
+        return fill, fee, tax
+
+    # ---------- 撮合 ----------
+    def _buy(self, price: float, qty: int, cash: float, date):
+        fill, fee, tax = self._quote(price, qty, "BUY")
+        cost = fill * qty + fee + tax
+        # 资金不足时向下取整到整百股，确保 cost <= cash
+        if cost > cash:
+            if self.cost:
+                notional_unit = abs(fill * (1 + self.cost.commission_rate + self.cost.impact))
+                floor_fee = self.cost.min_fee
+            else:
+                notional_unit = fill * (1 + self.commission)
+                floor_fee = 0.0
+            max_q = int((cash - floor_fee) / notional_unit // _LOT) * _LOT
+            qty = max(0, min(qty, max_q))
+            if qty <= 0:
+                return cash, 0, None
+            fill, fee, tax = self._quote(price, qty, "BUY")
+            cost = fill * qty + fee + tax
+        cash -= cost
+        trade = {"date": str(date), "side": "BUY", "price": round(fill, 3),
+                 "qty": qty, "cash_after": round(cash, 2), "fee": round(fee + tax, 2)}
+        return cash, qty, trade
+
+    def _sell(self, price: float, qty: int, cash: float, date, reason: str = "signal"):
+        fill, fee, tax = self._quote(price, qty, "SELL")
+        proceed = fill * qty - fee - tax
+        cash += proceed
+        trade = {"date": str(date), "side": "SELL", "price": round(fill, 3),
+                 "qty": qty, "reason": reason, "cash_after": round(cash, 2),
+                 "fee": round(fee + tax, 2)}
+        return cash, 0, trade
+
+    # ---------- 主循环 ----------
+    def run(self, df: pd.DataFrame, signals: pd.Series) -> BacktestResult:
+        cash = self.init_cash
+        shares = 0
+        entry_price = 0.0
+        equity, dates = [], []
+
+        if signals is not None:
+            sig = signals.reindex(df.index)
+            # 隐性对齐：df 通常只在 `date` 列存日期、index 为默认整数；
+            # 若按 index 对齐全为 NaN（信号以日期索引），改用 date 列对齐，避免静默全零。
+            if sig.isna().all() and "date" in df.columns:
+                sig = signals.reindex(pd.to_datetime(df["date"]))
+                sig.index = df.index
+            sig = sig.fillna(0)
+        else:
+            sig = pd.Series(0, index=df.index)
+        for i, row in df.iterrows():
+            price = float(row["close"])
+            s = int(sig.loc[i])
+
+            # 持仓中断损
+            if shares > 0 and self.risk.check_exit(entry_price, price):
+                cash, shares, trade = self._sell(price, shares, cash, row["date"], "stop_loss")
+                self._log(trade)
+                entry_price = 0.0
+
+            # 买入信号
+            if s == 1 and shares == 0:
+                size = self.risk.position_size(cash, price)
+                budget = cash * size
+                qty = int(budget / (price * (1 + self.slippage + self.commission)) // _LOT) * _LOT
+                if qty > 0 and self.risk.check_entry(str(row.get("symbol", "")), cash):
+                    cash, shares, trade = self._buy(price, qty, cash, row["date"])
+                    if trade is not None:
+                        self._log(trade)
+                        entry_price = price
+
+            # 卖出信号
+            elif s == -1 and shares > 0:
+                cash, shares, trade = self._sell(price, shares, cash, row["date"], "signal")
+                self._log(trade)
+                entry_price = 0.0
+
+            equity.append(cash + shares * price)
+            dates.append(row["date"])
+
+        eq = pd.Series(equity, index=pd.to_datetime(dates), name="equity")
+        return BacktestResult(eq, self.trades, sig, df)
+
+    def _log(self, trade: dict):
+        self.trades.append(trade)
