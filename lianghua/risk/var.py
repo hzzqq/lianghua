@@ -14,7 +14,8 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-__all__ = ["historical_var", "parametric_var", "cvar", "monte_carlo_var", "var_report"]
+__all__ = ["historical_var", "parametric_var", "cvar", "monte_carlo_var",
+           "cornish_fisher_var", "var_report"]
 
 # 常用置信度对应的标准正态分位数（避免依赖 scipy）
 _Z = {0.90: 1.2816, 0.95: 1.6449, 0.975: 1.9600, 0.99: 2.3263, 0.995: 2.5758}
@@ -33,15 +34,18 @@ def _z_score(conf: float) -> float:
     b = [-5.447609879822406e+01, 1.615858368580409e+02, -1.556989798598866e+02,
          6.680131188771972e+01, -1.328068155288572e+01]
     q = np.sqrt(-2 * np.log(p))
-    z = (((((a[0] * q + a[1]) * q + a[2]) * q + a[3]) * q + a[4]) * q + a[5]) / \
-        ((((b[0] * q + b[1]) * q + b[2]) * q + b[3]) * q + b[4] * q / q)
-    return abs(z)
+    num = (((((a[0] * q + a[1]) * q + a[2]) * q + a[3]) * q + a[4]) * q + a[5])
+    den = (((((b[0] * q + b[1]) * q + b[2]) * q + b[3]) * q + b[4]))
+    return abs(num / den)
 
 
 def _clean(returns: pd.Series) -> pd.Series:
-    r = pd.Series(returns).dropna()
+    r = pd.Series(returns)
+    # 隐性修复：dropna 仅剔除 NaN，会把 inf 漏进来污染分位数 -> 静默产出 inf VaR。
+    # 这里同时过滤非有限值（NaN 与 inf/-inf）。
+    r = r[np.isfinite(r)]
     if len(r) < 2:
-        raise ValueError("收益率序列太短，至少需要 2 个观测值")
+        raise ValueError("收益率序列太短或含过多非有限值，至少需要 2 个有限观测值")
     return r
 
 
@@ -68,6 +72,36 @@ def cvar(returns: pd.Series, conf: float = 0.95) -> float:
     if len(tail) == 0:
         return float(max(0.0, var))
     return float(max(0.0, -tail.mean()))
+
+
+def cornish_fisher_var(returns: pd.Series, conf: float = 0.95) -> float:
+    """Cornish-Fisher 修正 VaR（考虑偏度与超额峰度的"修正 VaR"）。
+
+    普通参数法假设收益正态；当收益显著偏斜或有厚尾时误差很大。本函数用
+    Cornish-Fisher 展开对标准正态分位数做偏度/峰度修正：
+
+        z_cf = z + (z^2-1)*S/6 + (z^3-3z)*K/24 - (2z^3-5z)*S^2/36
+
+    其中 S 为偏度、K 为超额峰度（pandas 默认 excess=True）。返回正数损失幅度。
+
+    new_requirement（新增能力）：修正 VaR 是机构风险管理的标配，原模块只有正态假设。
+    """
+    if not (0.0 < conf < 1.0):
+        raise ValueError("conf 必须介于 0 与 1 之间")
+    r = _clean(returns)
+    mu = float(r.mean())
+    sigma = float(r.std(ddof=1))
+    if sigma <= 0:
+        # 退化标准差：收益恒定，无波动风险，VaR 取 0 更稳健（而非用 1e-12 造出假风险）
+        return 0.0
+    skew = float(r.skew())
+    exkurt = float(r.kurt())
+    z = _z_score(conf)
+    z_cf = (z
+            + (z ** 2 - 1.0) * skew / 6.0
+            + (z ** 3 - 3.0 * z) * exkurt / 24.0
+            - (2.0 * z ** 3 - 5.0 * z) * skew ** 2 / 36.0)
+    return float(max(0.0, -(mu - z_cf * sigma)))
 
 
 def monte_carlo_var(returns: pd.Series, conf: float = 0.95,
