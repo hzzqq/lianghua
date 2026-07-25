@@ -9,6 +9,26 @@ import numpy as np
 import pandas as pd
 
 
+def _align_weights(weights, columns) -> np.ndarray:
+    """把权重对齐到 returns 的列顺序（隐性修复）。
+
+    weights 可传 ndarray / Series / dict。若传 Series 或 dict 但顺序/键与
+    returns.columns 不一致，原实现直接 np.asarray 会丢索引导致错位——
+    权重被错配到错误资产上而毫无报错。这里统一按列重新对齐，缺失列补 0。
+    """
+    if isinstance(weights, pd.Series):
+        w = weights.reindex(columns).fillna(0.0)
+    elif isinstance(weights, dict):
+        w = pd.Series({c: float(weights.get(c, 0.0)) for c in columns})
+    else:
+        w = np.asarray(weights, dtype=float)
+        if w.shape[0] != len(columns):
+            raise ValueError(
+                f"权重长度 {w.shape[0]} 与资产数 {len(columns)} 不一致")
+        return w
+    return np.asarray(w, dtype=float)
+
+
 def downside_deviation(returns: pd.Series, mar: float = 0.0) -> float:
     """下行标准差：只统计低于最小可接受收益(MAR)的波动。"""
     r = pd.Series(returns).astype(float).dropna()
@@ -51,7 +71,7 @@ def component_var(returns: pd.DataFrame, weights, alpha: float = 0.05) -> pd.Ser
     参数法（正态近似）：成分风险贡献 CCTR_i = w_i·(Σw)_i/σ_p，
     再乘 -z_α 转为 VaR 口径（正数=风险贡献）。∑CCTR = σ_p。
     """
-    w = np.asarray(weights, dtype=float)
+    w = _align_weights(weights, returns.columns)  # 隐性修复：按列对齐，避免错位
     cov = returns.cov().values
     port_var = float(w @ cov @ w)
     port_vol = np.sqrt(port_var) + 1e-12
@@ -99,9 +119,26 @@ def risk_contribution(returns: pd.DataFrame, weights, annual: int = 252) -> pd.S
     ∑CCTR = 年化组合波动 σ_p；正值表示该资产增加组合风险。
     weights 可为 Series/ndarray，按 returns.columns 对齐。
     """
-    w = np.asarray(weights, dtype=float)
+    w = _align_weights(weights, returns.columns)  # 隐性修复：按列对齐，避免错位
     cov = returns.cov().values * annual
     port_vol = np.sqrt(max(float(w @ cov @ w), 1e-12))
     mctr = (cov @ w) / port_vol
     cctr = w * mctr
     return pd.Series(cctr, index=returns.columns)
+
+
+def diversification_ratio(returns: pd.DataFrame, weights,
+                          annual: int = 252) -> float:
+    """分散化比率（新增能力）：加权个券波动率之和 / 组合波动率。
+
+    DR > 1 表示分散化降低了整体风险，越大越分散；=1 表示无分散收益
+    （如所有权重集中或资产完全相关）。权重以 returns.columns 对齐，缺失补 0。
+    """
+    w = _align_weights(weights, returns.columns)
+    cov = returns.cov().values * annual
+    port_vol = np.sqrt(max(float(w @ cov @ w), 1e-12))
+    asset_vol = np.sqrt(np.diag(cov))
+    wavg = float((np.abs(w) * asset_vol).sum())
+    if port_vol <= 0 or wavg <= 0:
+        return 1.0
+    return float(wavg / port_vol)
