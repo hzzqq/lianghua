@@ -85,8 +85,10 @@ def vectorized_backtest(df: pd.DataFrame, signals: pd.Series,
     cost_rate = max(0.0, float(cost_rate))
 
     close = pd.Series(df["close"]).astype(float).reset_index(drop=True)
-    # 隐性修复：非正价格会产生 inf 收益率
-    close = close.mask(close <= 0, np.nan).ffill().fillna(0.0)
+    # 隐性修复：原仅屏蔽 <=0，未处理原始 NaN 价；NaN 经 ffill 残留会污染
+    # pct_change / cumprod，导致收益率与净值出现 NaN/inf。这里统一把
+    # 非有限与非正价格视为无效并前向填充。
+    close = close.mask(~np.isfinite(close) | (close <= 0), np.nan).ffill().fillna(0.0)
     if close.eq(0).all():
         # 全为零/空数据：安全返回空结果
         empty_eq = pd.Series([], dtype=float)

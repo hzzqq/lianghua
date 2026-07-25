@@ -13,6 +13,7 @@ v2 改进：
 """
 from __future__ import annotations
 
+import numpy as np
 import pandas as pd
 
 from ..perf.metrics import max_drawdown
@@ -25,11 +26,12 @@ _LOT = 100
 class BacktestResult:
     """回测结果容器。"""
 
-    def __init__(self, equity: pd.Series, trades: list[dict], signals: pd.Series, df: pd.DataFrame):
+    def __init__(self, equity: pd.Series, trades: list[dict], signals: pd.Series, df: pd.DataFrame, skipped: int = 0):
         self.equity = equity
         self.trades = trades
         self.signals = signals
         self.df = df
+        self.skipped = skipped
 
     def to_frame(self) -> pd.DataFrame:
         out = pd.DataFrame(index=self.equity.index)
@@ -40,6 +42,13 @@ class BacktestResult:
             out["close"] = self.df["close"].values[: len(self.equity)]
         return out
 
+    def returns(self) -> pd.Series:
+        """返回逐日收益序列（新增能力，供下游绩效复用）。"""
+        eq = self.equity
+        if eq is None or len(eq) < 2:
+            return pd.Series([], dtype=float)
+        return eq.pct_change().fillna(0.0)
+
     def stats(self) -> dict:
         """汇总回测绩效指标，便于审计与对比。"""
         eq = self.equity
@@ -48,11 +57,14 @@ class BacktestResult:
                     "max_drawdown": 0.0, "final_equity": 0.0}
         start = float(eq.iloc[0])
         end = float(eq.iloc[-1])
-        total_return = (end - start) / start if start != 0 else 0.0
+        # 隐性修复：首值为 NaN 时 total_return 应为 0 而非 NaN
+        total_return = (end - start) / start if (pd.notna(start) and start != 0) else 0.0
+        # 隐性修复：含 NaN/inf 的权益会让 max_drawdown 抛错，降级为 0
+        md = max_drawdown(eq) if np.isfinite(eq.to_numpy()).all() else 0.0
         return {
             "total_return": total_return,
             "n_trades": len(self.trades),
-            "max_drawdown": max_drawdown(eq),
+            "max_drawdown": md,
             "final_equity": end,
         }
 
@@ -132,28 +144,50 @@ class BacktestEngine:
 
     # ---------- 主循环 ----------
     def run(self, df: pd.DataFrame, signals: pd.Series) -> BacktestResult:
+        if not isinstance(df, pd.DataFrame):
+            raise ValueError("df 必须是含 close 列的 DataFrame")
+        if "close" not in df.columns:
+            raise ValueError("df 必须包含 'close' 列")
+        has_date = "date" in df.columns
         cash = self.init_cash
         shares = 0
         entry_price = 0.0
         equity, dates = [], []
+        last_price = None
+        skipped = 0
+        pos = 0
 
         if signals is not None:
             sig = signals.reindex(df.index)
             # 隐性对齐：df 通常只在 `date` 列存日期、index 为默认整数；
             # 若按 index 对齐全为 NaN（信号以日期索引），改用 date 列对齐，避免静默全零。
-            if sig.isna().all() and "date" in df.columns:
+            if sig.isna().all() and has_date:
                 sig = signals.reindex(pd.to_datetime(df["date"]))
                 sig.index = df.index
             sig = sig.fillna(0)
         else:
             sig = pd.Series(0, index=df.index)
         for i, row in df.iterrows():
-            price = float(row["close"])
-            s = int(sig.loc[i])
+            dt = row["date"] if has_date else df.index[pos]
+            try:
+                price = float(row["close"])
+            except (TypeError, ValueError):
+                price = float("nan")
+            # 隐性修复：NaN / 非正价格会让 int(budget/(price*...)) 抛 ValueError、
+            # price=0 触发 ZeroDivision；改为跳过当日交易并沿用上一有效价估值。
+            if not np.isfinite(price) or price <= 0:
+                skipped += 1
+                val_price = last_price if last_price is not None else 0.0
+                equity.append(cash + shares * val_price)
+                dates.append(dt)
+                pos += 1
+                continue
+            last_price = price
+            s = int(sig.iloc[pos])
 
             # 持仓中断损
             if shares > 0 and self.risk.check_exit(entry_price, price):
-                cash, shares, trade = self._sell(price, shares, cash, row["date"], "stop_loss")
+                cash, shares, trade = self._sell(price, shares, cash, dt, "stop_loss")
                 self._log(trade)
                 entry_price = 0.0
 
@@ -163,22 +197,23 @@ class BacktestEngine:
                 budget = cash * size
                 qty = int(budget / (price * (1 + self.slippage + self.commission)) // _LOT) * _LOT
                 if qty > 0 and self.risk.check_entry(str(row.get("symbol", "")), cash):
-                    cash, shares, trade = self._buy(price, qty, cash, row["date"])
+                    cash, shares, trade = self._buy(price, qty, cash, dt)
                     if trade is not None:
                         self._log(trade)
                         entry_price = price
 
             # 卖出信号
             elif s == -1 and shares > 0:
-                cash, shares, trade = self._sell(price, shares, cash, row["date"], "signal")
+                cash, shares, trade = self._sell(price, shares, cash, dt, "signal")
                 self._log(trade)
                 entry_price = 0.0
 
             equity.append(cash + shares * price)
-            dates.append(row["date"])
+            dates.append(dt)
+            pos += 1
 
         eq = pd.Series(equity, index=pd.to_datetime(dates), name="equity")
-        return BacktestResult(eq, self.trades, sig, df)
+        return BacktestResult(eq, self.trades, sig, df, skipped=skipped)
 
     def _log(self, trade: dict):
         self.trades.append(trade)
