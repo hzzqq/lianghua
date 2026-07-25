@@ -10,16 +10,42 @@ from ..perf.metrics import report as perf_report
 from ..backtest.montecarlo import bootstrap
 
 
+def _finite(v) -> bool:
+    """判断值是否为有限实数（排除 None / NaN / ±inf，以及无法转为浮点的类型）。"""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return False
+    return f == f and abs(f) != float("inf")
+
+
+def _fmt_pct(v, nd: int = 1) -> str:
+    return f"{v * 100:.{nd}f}%" if _finite(v) else "N/A"
+
+
+def _fmt_num(v, nd: int = 2) -> str:
+    return f"{v:.{nd}f}" if _finite(v) else "N/A"
+
+
 def _equity_svg(equity: "object", w: int = 800, h: int = 240) -> str:
-    vals = equity.values.astype(float)
-    lo, hi = float(vals.min()), float(vals.max())
+    vals = [float(x) for x in equity.values.astype(float)]
+    finite = [v for v in vals if _finite(v)]
+    if len(finite) < 2:
+        return (
+            f'<svg viewBox="0 0 {w} {h}" width="100%" '
+            f'style="background:#12122a;border-radius:8px">'
+            f'<text x="20" y="{h // 2}" fill="#9aa0c0">无有效权益数据</text></svg>'
+        )
+    lo, hi = min(finite), max(finite)
     if hi == lo:
         hi = lo + 1.0
     n = len(vals)
     pts = []
     for i, v in enumerate(vals):
+        # 非有限点落到基线，避免 polyline 出现 NaN 坐标而整条线断裂
+        fv = v if _finite(v) else lo
         x = 10 + (w - 20) * (i / max(1, n - 1))
-        y = h - 10 - (h - 20) * ((v - lo) / (hi - lo))
+        y = h - 10 - (h - 20) * ((fv - lo) / (hi - lo))
         pts.append(f"{x:.1f},{y:.1f}")
     return (
         f'<svg viewBox="0 0 {w} {h}" width="100%" preserveAspectRatio="none" '
@@ -38,7 +64,14 @@ def render_backtest_html(
     with_mc: bool = False,
 ) -> str:
     """渲染回测结果为完整 HTML 文档字符串。"""
-    p = perf_report(result.equity, result.trades, init_cash=init_cash)
+    trades = result.trades or []
+    try:
+        p = perf_report(result.equity, trades, init_cash=init_cash)
+        if not isinstance(p, dict):
+            p = {}
+    except Exception:
+        # equity 含 NaN/非正值等导致 perf_report 失败时，降级为全 N/A 卡片
+        p = {}
     mc_html = ""
     if with_mc:
         try:
@@ -60,17 +93,22 @@ def render_backtest_html(
             mc_html = ""
     rows = "".join(
         "<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>"
-        % (t.get("date", ""), t.get("side", ""), t.get("price", ""), t.get("qty", ""))
-        for t in result.trades[:100]
+        % (
+            html.escape(str(t.get("date", ""))),
+            html.escape(str(t.get("side", ""))),
+            html.escape(str(t.get("price", ""))),
+            html.escape(str(t.get("qty", ""))),
+        )
+        for t in (result.trades or [])[:100]
     )
     cards = "".join(
         '<div class="card"><div class="k">%s</div><div class="v">%s</div></div>' % (k, v)
         for k, v in [
-            ("总收益", "%.1f%%" % (p["total_return"] * 100)),
-            ("年化", "%.1f%%" % (p.get("annual_return", 0) * 100)),
-            ("夏普", "%.2f" % p["sharpe"]),
-            ("最大回撤", "%.1f%%" % (p["max_drawdown"] * 100)),
-            ("交易次数", "%d" % p["num_trades"]),
+            ("总收益", _fmt_pct(p.get("total_return", float("nan")))),
+            ("年化", _fmt_pct(p.get("annual_return", float("nan")))),
+            ("夏普", _fmt_num(p.get("sharpe", float("nan")))),
+            ("最大回撤", _fmt_pct(p.get("max_drawdown", float("nan")))),
+            ("交易次数", "%d" % int(p.get("num_trades", 0) or 0)),
         ]
     )
     return f"""<!doctype html><html lang="zh"><head><meta charset="utf-8">
@@ -88,6 +126,6 @@ th{{color:#9aa0c0}}
 <div class="cards">{cards}</div>
 <h3>权益曲线</h3>{_equity_svg(result.equity)}
 {mc_html}
-<h3>交易明细（前 {min(100, len(result.trades))} 笔）</h3>
+<h3>交易明细（前 {min(100, len(result.trades or []))} 笔）</h3>
 <table><tr><th>日期</th><th>方向</th><th>价格</th><th>数量</th></tr>{rows}</table>
 </body></html>"""
