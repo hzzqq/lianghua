@@ -15,7 +15,7 @@ import pandas as pd
 
 from ..perf.metrics import sharpe
 
-__all__ = ["grid_search", "random_search", "walk_forward", "best_params"]
+__all__ = ["grid_search", "random_search", "walk_forward", "best_params", "summarize"]
 
 
 def _coerce(v):
@@ -122,6 +122,9 @@ def random_search(
 
 def _sample(v, rng):
     if isinstance(v, (list, set)):
+        # 隐性修复：空 list/set 会让 rng.choice([]) 抛 ValueError 且不在 _score 隔离内
+        if not v:
+            raise ValueError("param_dist 含空 list/set，无法采样")
         return rng.choice(list(v))
     if isinstance(v, tuple):
         if len(v) == 2:
@@ -177,9 +180,37 @@ def walk_forward(
 
 
 def best_params(res: pd.DataFrame) -> dict | None:
-    """从 grid_search / random_search 结果中取综合分最高的参数组合。"""
+    """从 grid_search / random_search 结果中取综合分最高的参数组合。
+
+    隐性修复：当全部组合均失败时 score 为 NaN，sort_values(ascending=False)
+    会把 NaN 排到末尾，iloc[0] 会取到 NaN 组合；这里只取有效（非 NaN）首行。
+    """
     if res is None or res.empty:
         return None
-    row = res.iloc[0]
+    valid = res[~res["score"].isna()]
+    if valid.empty:
+        return None
+    row = valid.iloc[0]
     keys = [c for c in res.columns if c not in ("score", "error")]
     return {k: row[k] for k in keys}
+
+
+def summarize(res: pd.DataFrame) -> dict:
+    """汇总一次搜索结果（新增能力）：最佳分、有效/失败数、分数均值与标准差。
+
+    供调用方快速判断搜索质量与过拟合风险，无需逐行翻阅结果表。
+    """
+    if res is None or res.empty:
+        return {"best_score": float("nan"), "mean": float("nan"),
+                "std": float("nan"), "n_valid": 0, "n_fail": 0, "n_total": 0}
+    scores = pd.to_numeric(res["score"], errors="coerce")
+    valid = scores.dropna()
+    fails = res.get("error", pd.Series([], dtype=object)).fillna("") != ""
+    return {
+        "best_score": float(valid.max()) if not valid.empty else float("nan"),
+        "mean": float(valid.mean()) if not valid.empty else float("nan"),
+        "std": float(valid.std()) if not valid.empty else float("nan"),
+        "n_valid": int(len(valid)),
+        "n_fail": int(fails.sum()),
+        "n_total": int(len(res)),
+    }

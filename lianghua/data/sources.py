@@ -15,13 +15,17 @@ import pandas as pd
 
 def _synth_frame(symbol: str, start: str, end: str, seed: int = 0) -> pd.DataFrame:
     """确定性几何随机游走（合成演示行情），保证离线可用。"""
+    s, e = pd.Timestamp(start), pd.Timestamp(end)
+    # 隐性修复：start > end 会让 bdate_range 直接抛 ValueError；演示源应兜底
+    if s > e:
+        s, e = e, s
     h = int(hashlib.md5(str(symbol).encode()).hexdigest(), 16)
     rng = np.random.default_rng(h ^ seed)
-    dates = pd.bdate_range(start, end)
+    dates = pd.bdate_range(s, e)
     n = len(dates)
     if n < 2:
         n = 2
-        dates = pd.bdate_range(start, periods=n)
+        dates = pd.bdate_range(s, periods=n)
     rets = rng.normal(0.0005, 0.015, n)
     close = 100.0 * np.cumprod(1.0 + rets)
     close = np.maximum(close, 1.0)
@@ -79,7 +83,8 @@ class AkshareSource(BaseSource):
                 df = df.rename(columns={"日期": "date", "开盘": "open", "最高": "high",
                                         "最低": "low", "收盘": "close", "成交量": "volume"})
             df["date"] = pd.to_datetime(df["date"])
-            return df[["date", "open", "high", "low", "close", "volume"]]
+            df = df[["date", "open", "high", "low", "close", "volume"]]
+            return validate_ohlcv(df)
         except Exception:
             return None
 
@@ -109,7 +114,8 @@ class BaoStockSource(BaseSource):
             for c in ["open", "high", "low", "close", "volume"]:
                 df[c] = pd.to_numeric(df[c], errors="coerce")
             df["date"] = pd.to_datetime(df["date"])
-            return df.dropna()
+            df = df.dropna()
+            return validate_ohlcv(df)
         except Exception:
             return None
 
@@ -119,6 +125,32 @@ REGISTRY = {
     "akshare": AkshareSource,
     "baostock": BaoStockSource,
 }
+
+
+def validate_ohlcv(df, require_positive_close: bool = True) -> pd.DataFrame:
+    """校验并清洗 OHLCV DataFrame（新增数据质量门）。
+
+    - 必须包含 date/open/high/low/close/volume 六列，否则抛 ValueError；
+    - 行情列强制转数值并剔除含 NaN 的行；
+    - 默认要求 close > 0，剔除非正价（避免下游 pct_change 产生 inf）；
+    - 清洗后为空同样抛 ValueError。
+    真实数据源在返回前调用本函数，保证传给下游的行情是干净的。
+    """
+    if df is None:
+        raise ValueError("OHLCV 为 None")
+    required = ["date", "open", "high", "low", "close", "volume"]
+    missing = [c for c in required if c not in getattr(df, "columns", [])]
+    if missing:
+        raise ValueError(f"OHLCV 缺少列: {missing}")
+    out = df.copy()
+    ohlc = ["open", "high", "low", "close"]
+    out[ohlc] = out[ohlc].apply(pd.to_numeric, errors="coerce")
+    out = out.dropna(subset=ohlc)
+    if require_positive_close:
+        out = out[out["close"] > 0]
+    if out.empty:
+        raise ValueError("OHLCV 清洗后为空（无有效行情行）")
+    return out.reset_index(drop=True)
 
 
 def list_sources() -> list[str]:
@@ -152,4 +184,5 @@ def fetch_any(symbol: str, start: str, end: str, asset: str = "stock",
 
 
 __all__ = ["BaseSource", "SyntheticSource", "AkshareSource", "BaoStockSource",
-           "REGISTRY", "list_sources", "make_source", "fetch_from", "fetch_any"]
+           "REGISTRY", "list_sources", "make_source", "fetch_from", "fetch_any",
+           "validate_ohlcv"]
