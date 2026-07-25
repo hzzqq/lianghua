@@ -16,6 +16,66 @@ from ..portfolio.registry import get_optimizer, OPTIMIZER_INFO
 from .runner import run_backtest
 
 
+def _normalize_to_base(eq: pd.Series) -> pd.Series:
+    """把净值归一化到 1.0 起点（隐性修复）。
+
+    原实现用 `eq / eq.iloc[0]`：若首个净值为 0 会得到 inf，而随后的
+    `ffill().fillna(1.0)` 不会替换 inf，导致组合被 inf 污染且无任何报错。
+    这里改取首个有限且非零的值作为基准，全程无 inf/NaN。
+    """
+    if len(eq) == 0:
+        return eq
+    first_val = eq.iloc[0]
+    if not np.isfinite(first_val) or first_val == 0:
+        cand = eq.replace(0, np.nan).dropna()
+        first_val = float(cand.iloc[0]) if len(cand) else 1.0
+    return eq / first_val
+
+
+def walk_forward_weights(returns: pd.DataFrame, optimizer_fn,
+                         rebalance: str = "M",
+                         lookback: int | None = None) -> pd.DataFrame:
+    """滚动再平衡权重（新增能力）：在每个 rebalance 频率点，用截至该点的历史收益
+    （可选仅最近 lookback 窗口）重新估计权重，输出 日期×资产 的权重路径表。
+
+    相比单次静态优化，滚动权重能适应市场状态切换、降低前视偏差，适合稳健配置。
+    任一折叠估计失败/退化时回退等权，保证输出始终有限且归一。
+    """
+    if not isinstance(returns, pd.DataFrame):
+        raise TypeError("returns 必须是 DataFrame（每列一个资产，行=日收益）")
+    if returns.shape[1] == 0:
+        raise ValueError("returns 至少需要一个资产列")
+    r = returns.replace([np.inf, -np.inf], np.nan).ffill().fillna(0.0)
+    try:
+        grouper = r.groupby(pd.Grouper(freq=rebalance))
+    except Exception as exc:  # 非法频率
+        raise ValueError(f"非法 rebalance 频率: {rebalance!r}") from exc
+    cols = r.columns
+    out_rows, out_idx = [], []
+    for _name, group in grouper:
+        if group.empty:
+            continue
+        end_pos = r.index.get_loc(group.index[-1])
+        seg = r.iloc[: end_pos + 1]
+        if lookback is not None:
+            seg = seg.iloc[-int(lookback):]
+        if seg.shape[0] < 2:
+            w = pd.Series(1.0 / len(cols), index=cols)
+        else:
+            try:
+                w = optimizer_fn(seg)
+            except Exception:
+                w = pd.Series(1.0 / len(cols), index=cols)
+            w = w.reindex(cols).fillna(0.0)
+            s = float(w.sum())
+            w = w / s if s > 0 else pd.Series(1.0 / len(cols), index=cols)
+        out_rows.append(w.values)
+        out_idx.append(group.index[-1])
+    if not out_rows:
+        return pd.DataFrame(columns=cols)
+    return pd.DataFrame(out_rows, index=pd.DatetimeIndex(out_idx), columns=cols)
+
+
 def run_plan(
     plan: list[dict],
     init_cash: float = 1_000_000.0,
@@ -90,8 +150,8 @@ def run_plan(
             gw=gw,
         )
         eq = res.equity
-        # 归一化到 1.0 起点，便于按权重合并
-        norm = eq / eq.iloc[0]
+        # 归一化到 1.0 起点，便于按权重合并（隐性修复：避免首个净值为0产inf）
+        norm = _normalize_to_base(eq)
         components[spec["symbol"]] = {
             "equity": eq,
             "metrics": summary(eq, res.trades),
