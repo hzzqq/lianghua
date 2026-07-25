@@ -252,20 +252,79 @@ def factor_winsorize(factor, lower: float = 0.01, upper: float = 0.99):
 # 迭代 181+：更多因子稳定性 / 组合函数（超自驱动目标）
 # ============================================================
 def factor_corr(factor, target) -> float:
-    """因子与目标（如前瞻收益）的截面相关均值：>0 同向、越稳定越有效。"""
+    """因子与目标（如前瞻收益）的截面相关均值：>0 同向、越稳定越有效。
+
+    隐性修复：因子与目标资产数不一致时（单因子 vs 多资产目标），原实现用
+    concat 复制列后再 `reindex(columns=tg.columns)`，因复制出的列名与原列名
+    相同而目标列名不同，触发 "cannot reindex on an axis with duplicate labels"
+    异常，且对齐完全错误。改为按目标宽度用 numpy tile 重建等宽面板后再按索引
+    对齐，避免崩溃与静默 NaN。
+    """
     fa = pd.DataFrame(factor).astype(float)
     tg = pd.DataFrame(target).astype(float)
     if fa.shape[1] == 1 and tg.shape[1] > 1:
-        fa = pd.concat([fa] * tg.shape[1], axis=1)
+        fa = pd.DataFrame(np.tile(fa.values, (1, tg.shape[1])),
+                          index=fa.index, columns=tg.columns)
     if tg.shape[1] == 1 and fa.shape[1] > 1:
-        tg = pd.concat([tg] * fa.shape[1], axis=1)
-    fa = fa.reindex(columns=tg.columns)
+        tg = pd.DataFrame(np.tile(tg.values, (1, fa.shape[1])),
+                          index=tg.index, columns=fa.columns)
+    fa, tg = fa.align(tg, join="inner", axis=0)
+    if fa.shape[0] == 0 or fa.shape[1] == 0:
+        return 0.0
     corrs = []
-    for i in range(len(fa)):
-        c = fa.iloc[i].corr(tg.iloc[i])
-        if pd.notna(c):
-            corrs.append(float(c))
+    # 退化的截面（某行方差=0）相关性无定义，pandas 会产出 NaN 与 numpy 告警；
+    # 这里静默忽略告警，NaN 由后续 notna 过滤，避免污染测试输出与下游。
+    with np.errstate(invalid="ignore", divide="ignore"):
+        for i in range(len(fa)):
+            c = fa.iloc[i].corr(tg.iloc[i])
+            if pd.notna(c):
+                corrs.append(float(c))
     return float(np.mean(corrs)) if corrs else 0.0
+
+
+def factor_group_neutralize(factor_panel, groups, method: str = "zscore") -> pd.DataFrame:
+    """分组中性化（新增能力）：在每个分组内对因子做标准化，剔除组间水平差异。
+
+    典型用途：因子在不同行业/市值规模上有系统性偏移，先做行业内中性化
+    （去行业均值、可选除行业标准差）后再合成或计算 IC，避免因子沦为行业暴露。
+
+    参数
+    ----
+    factor_panel : index=日期, columns=资产 的因子面板
+    groups       : {资产: 组标签} 字典，或与 columns 同序的组标签列表
+    method       : "zscore"（去均值并除组标准差）| "demean"（仅去组均值）
+
+    返回
+    ----
+    与输入同形的中性化因子面板。
+    """
+    if method not in ("zscore", "demean"):
+        raise ValueError("method 必须是 'zscore' 或 'demean'")
+    fp = pd.DataFrame(factor_panel).astype(float)
+    if isinstance(groups, dict):
+        glabel = pd.Series(groups)
+    else:
+        glabel = pd.Series(dict(zip(fp.columns, list(groups))))
+    glabel = glabel.reindex(fp.columns)
+    if glabel.isna().any():
+        raise ValueError("groups 必须为面板每个资产提供组标签")
+    out = fp.copy()
+    for d in fp.index:
+        row = fp.loc[d]
+        res = row.copy()
+        for _, idx in row.groupby(glabel).groups.items():
+            sub = row.loc[idx]
+            if len(sub) == 0:
+                continue
+            mu = sub.mean()
+            if method == "zscore":
+                sd = float(sub.std(ddof=0))
+                sd = sd if (sd and sd > 0) else 1.0
+                res.loc[idx] = (sub - mu) / sd
+            else:
+                res.loc[idx] = sub - mu
+        out.loc[d] = res
+    return out.rename(columns=lambda c: c)
 
 
 def factor_orthogonalize(factor_a, factor_b) -> pd.DataFrame:

@@ -5,6 +5,7 @@ import pytest
 
 from lianghua.factor.combine import (
     factor_combine, factor_portfolio, factor_autocorr, factor_turnover,
+    factor_corr, factor_group_neutralize,
 )
 
 
@@ -90,3 +91,49 @@ def test_autocorr_turnover_finite():
     p = _panel()
     assert np.isfinite(factor_autocorr(p))
     assert 0.0 <= factor_turnover(p) <= 1.0
+
+
+def test_factor_corr_mismatched_width_no_crash():
+    # 隐性修复：单因子 vs 多资产目标，原实现会因重复列 reindex 抛异常
+    idx = pd.date_range("2023-01-01", periods=12, freq="D")
+    f = pd.DataFrame({"A": np.arange(12.0)}, index=idx)
+    t = pd.DataFrame(np.random.default_rng(0).normal(0, 1, (12, 3)),
+                     index=idx, columns=["A", "B", "C"])
+    c = factor_corr(f, t)
+    assert np.isfinite(c)
+    # 多资产因子 vs 单资产目标 也应正常
+    c2 = factor_corr(t, f)
+    assert np.isfinite(c2)
+
+
+def test_factor_corr_perfect_positive():
+    idx = pd.date_range("2023-01-01", periods=10, freq="D")
+    x = pd.DataFrame({"A": np.arange(10.0), "B": np.arange(10.0) * 2}, index=idx)
+    y = pd.DataFrame({"A": np.arange(10.0), "B": np.arange(10.0) * 2}, index=idx)
+    assert abs(factor_corr(x, y) - 1.0) < 1e-9
+
+
+def test_factor_group_neutralize_removes_group_mean():
+    # 新增能力：组内中性化后，每组内因子均值应≈0
+    idx = pd.date_range("2023-01-01", periods=1, freq="D")
+    fp = pd.DataFrame({"A": [1.0], "B": [3.0], "C": [2.0], "D": [10.0]}, index=idx)
+    groups = {"A": "g1", "B": "g1", "C": "g1", "D": "g2"}
+    out = factor_group_neutralize(fp, groups, method="demean")
+    assert abs(out.loc[idx[0], "A"] + out.loc[idx[0], "B"] + out.loc[idx[0], "C"]) < 1e-9
+    # g2 仅一个资产，demean 后应归零
+    assert abs(out.loc[idx[0], "D"]) < 1e-9
+
+
+def test_factor_group_neutralize_zscore_shape_preserved():
+    p = _panel(n=20, m=6, seed=3)
+    groups = {c: ("g1" if i < 3 else "g2") for i, c in enumerate(p.columns)}
+    out = factor_group_neutralize(p, groups, method="zscore")
+    assert out.shape == p.shape
+    assert np.all(np.isfinite(out.values))
+
+
+def test_factor_group_neutralize_rejects_missing_label():
+    idx = pd.date_range("2023-01-01", periods=1, freq="D")
+    fp = pd.DataFrame({"A": [1.0], "B": [2.0]}, index=idx)
+    with pytest.raises(ValueError):
+        factor_group_neutralize(fp, {"A": "g1"})  # 缺 B 标签
