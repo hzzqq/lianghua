@@ -19,15 +19,21 @@ def pre_trade_check(order: Order, account: dict,
     返回 (是否通过, 原因)。
     """
     limits = limits or {}
-    if order.qty <= int(limits.get("min_qty", 0)):
-        return False, f"数量须为正（min_qty={limits.get('min_qty', 0)}）"
+    min_qty = int(limits.get("min_qty", 0))
+    if order.qty <= min_qty:
+        return False, f"数量须为正且 > min_qty({min_qty})，收到 {order.qty}"
+    side = str(order.side).upper()
+    if side not in ("BUY", "SELL"):
+        return False, f"side 非法：{order.side}"
+    if not (float(order.price) > 0):
+        return False, f"价格必须为正数，收到 {order.price}"
     if order.symbol in (limits.get("blocked") or []):
         return False, f"标的 {order.symbol} 在禁止清单"
     notional = order.qty * order.price
     max_ov = float(limits.get("max_order_value", float("inf")))
     if notional > max_ov:
         return False, f"单笔金额 {notional:.0f} 超过上限 {max_ov:.0f}"
-    if order.side == "BUY":
+    if side == "BUY":
         raw_cash = account.get("cash", 0.0)
         cash = float(raw_cash) if raw_cash is not None else 0.0
         if notional > cash:
