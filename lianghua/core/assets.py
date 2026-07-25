@@ -55,6 +55,54 @@ class ContractSpec:
         """每跳动一点对应的合约价值。"""
         return self.multiplier * self.contract_size
 
+    def validate(self) -> None:
+        """校验合约规格合法性，非法时抛 ValueError。
+
+        隐性修复：原先规格由默认 dict 拼接，若配置错误（如 margin_rate=0）
+        会被静默接受，导致保证金计算产出 0、等于无限杠杆而无人察觉。
+        """
+        if self.multiplier <= 0:
+            raise ValueError(f"multiplier 必须为正，得到 {self.multiplier}")
+        if self.contract_size <= 0:
+            raise ValueError(f"contract_size 必须为正，得到 {self.contract_size}")
+        if not (0 < self.margin_rate <= 1.0):
+            raise ValueError(f"margin_rate 必须在 (0,1]，得到 {self.margin_rate}")
+        if self.commission_per_hand < 0:
+            raise ValueError(
+                f"commission_per_hand 不能为负，得到 {self.commission_per_hand}"
+            )
+        if self.asset_type == AssetType.OPTION:
+            if self.strike <= 0:
+                raise ValueError(f"期权 strike 必须为正，得到 {self.strike}")
+            if self.opt_type not in ("CALL", "PUT"):
+                raise ValueError(f"期权 opt_type 必须 CALL/PUT，得到 {self.opt_type}")
+
+    def required_margin(self, notional: float) -> float:
+        """按当前规格计算某名义金额所需的保证金（新增能力）。"""
+        return float(notional) * self.margin_rate
+
+
+def normalize_symbol(symbol: str) -> str:
+    """归一化 symbol：去空白、转大写。"""
+    return symbol.strip().upper()
+
+
+def describe_symbol(symbol: str, asset_type: AssetType | None = None) -> dict:
+    """返回 symbol 的资产类型与关键合约规格，供 UI/CLI 能力发现（新增能力）。"""
+    at = asset_type or detect_asset_type(symbol)
+    spec = get_contract_spec(symbol, at)
+    return {
+        "symbol": normalize_symbol(symbol),
+        "asset_type": at.value,
+        "underlying": spec.underlying,
+        "multiplier": spec.multiplier,
+        "contract_size": spec.contract_size,
+        "margin_rate": spec.margin_rate,
+        "point_value": spec.point_value,
+        "opt_type": spec.opt_type or None,
+        "strike": spec.strike or None,
+    }
+
 
 def detect_asset_type(symbol: str) -> AssetType:
     """根据 symbol 自动识别资产类别。"""
@@ -106,7 +154,7 @@ def get_contract_spec(symbol: str, asset_type: AssetType | None = None) -> Contr
         info = _parse_option(symbol)
         base = info["underlying"]
         spec = _DEFAULT_SPECS.get(base, dict(multiplier=10000, margin_rate=1.0))
-        return ContractSpec(
+        cs = ContractSpec(
             asset_type=at, symbol=symbol, underlying=base,
             multiplier=spec.get("multiplier", 10000),
             margin_rate=spec.get("margin_rate", 1.0),
@@ -114,19 +162,25 @@ def get_contract_spec(symbol: str, asset_type: AssetType | None = None) -> Contr
             strike=info["strike"], opt_type=info["opt_type"],
             strike_scale=info["strike_scale"],
         )
+        cs.validate()
+        return cs
     if at == AssetType.FUTURE:
         # 取字母前缀作为品种，如 RB2410 -> RB
         m = re.match(r"^([A-Z]+)", symbol.upper())
         product = m.group(1) if m else symbol.upper()
         spec = _DEFAULT_SPECS.get(product, dict(multiplier=10, margin_rate=0.10))
-        return ContractSpec(
+        cs = ContractSpec(
             asset_type=at, symbol=symbol, underlying=symbol,
             multiplier=spec.get("multiplier", 10),
             margin_rate=spec.get("margin_rate", 0.10),
             commission_per_hand=spec.get("commission_per_hand", 0.0),
         )
+        cs.validate()
+        return cs
     # 股票 / 基金：全额，1 手=1 单位
-    return ContractSpec(
+    cs = ContractSpec(
         asset_type=at, symbol=symbol, underlying=symbol,
         multiplier=1.0, contract_size=1.0, margin_rate=1.0,
     )
+    cs.validate()
+    return cs
