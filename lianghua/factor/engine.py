@@ -75,7 +75,10 @@ class FactorEngine:
         if valid.sum() < 30:
             return {"ic": float("nan"), "long_short_return": float("nan"), "n": int(valid.sum())}
         # Spearman IC = Pearson(rank(x), rank(y))，避免强依赖 scipy
-        ic = float(factor[valid].rank().corr(fwd[valid].rank()))
+        # 常数因子（零方差）相关无定义，会触发除零无效值警告 → 置 0
+        with np.errstate(divide="ignore", invalid="ignore"):
+            ic_val = factor[valid].rank().corr(fwd[valid].rank())
+        ic = 0.0 if pd.isna(ic_val) else float(ic_val)
         ranked = factor[valid].rank(method="first")
         # 隐性修复：因子取值过少（如常数因子）时 qcut 会抛错，用 duplicates="drop" 兜底
         try:

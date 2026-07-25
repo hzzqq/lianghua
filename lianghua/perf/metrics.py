@@ -39,6 +39,9 @@ def sharpe(equity: pd.Series, rf: float = 0.0, periods: int = 252) -> float:
         raise ValueError(f"periods 必须为正整数，收到 {periods!r}")
     s = _guard_equity(equity)
     r = daily_returns(s)
+    # 净值含 0 时 pct_change 会产出 inf，必须先剔除非有限收益，
+    # 否则 r.std() 触发无效值警告且可能返回 inf 污染下游
+    r = r[np.isfinite(r)]
     if len(r) < 2 or r.std(ddof=1) == 0:
         return 0.0
     return float((r.mean() - rf / periods) / r.std(ddof=1) * np.sqrt(periods))
@@ -48,7 +51,8 @@ def max_drawdown(equity: pd.Series) -> float:
     s = _guard_equity(equity)
     roll_max = s.cummax()
     dd = s / roll_max - 1.0
-    return float(dd.min())
+    dd = dd[roll_max > 0]          # 运行最高为 0 时（净值全 0）跳过，避免 0/0=nan
+    return float(dd.min()) if len(dd) else 0.0
 
 
 def underwater(equity: pd.Series) -> pd.Series:
