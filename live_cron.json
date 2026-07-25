@@ -1,0 +1,42 @@
+{
+  "symbols": ["600519.SH", "000300.SH", "IF.CFE"],
+  "routes": {
+    "by_asset": {"stock": "paper_stock", "fund": "paper_stock", "future": "paper_future"},
+    "by_prefix": {},
+    "default": "paper_stock"
+  },
+  "default_account": "paper_stock",
+  "rebalance": true,
+  "target_weights": {"paper_stock": 0.6, "paper_future": 0.4},
+  "notify": {
+    "wecom": "wecom_config.json"
+  },
+  "accounts": [
+    {
+      "name": "paper_stock",
+      "broker": "paper",
+      "strategy": "sma_cross",
+      "symbols": [],
+      "capital": 1000000.0,
+      "live": false,
+      "freq": "daily",
+      "sl_pct": 0.03,
+      "tp_pct": 0.06,
+      "trailing_pct": 0.04,
+      "risk": {"max_order_value": 200000, "blocked": []}
+    },
+    {
+      "name": "paper_future",
+      "broker": "paper",
+      "strategy": "macd",
+      "symbols": [],
+      "capital": 500000.0,
+      "live": false,
+      "freq": "daily",
+      "sl_pct": 0.02,
+      "tp_pct": 0.05,
+      "trailing_pct": 0.03,
+      "risk": {"max_order_value": 100000}
+    }
+  ]
+}
