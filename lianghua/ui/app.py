@@ -57,6 +57,7 @@ from lianghua.factor.returns import factor_long_short, factor_ic
 from lianghua.factor.layer import ic_series
 from lianghua.core.constants import ACCENT, COLOR_UP, COLOR_DOWN
 from lianghua.indicators import INDICATOR_FUNCS
+from lianghua.ui.widgets import safe_pct, safe_num, empty_figure
 from lianghua.core.capabilities import list_capabilities, summary_counts
 from lianghua.option.strategy import (OPTION_COMBO_REGISTRY, get_option_combo, payoff_curve)
 from lianghua.data.sources import list_sources, fetch_from
@@ -120,8 +121,11 @@ with st.sidebar:
 
 # ---------------- 通用辅助 ----------------
 def equity_chart(equity: pd.Series, title: str = "组合净值"):
+    eq = pd.Series(equity).astype(float) if equity is not None else pd.Series(dtype=float)
+    if len(eq) == 0 or not np.isfinite(eq).any():
+        return empty_figure("无有效净值数据")
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=equity.index, y=equity.values, name="净值",
+    fig.add_trace(go.Scatter(x=eq.index, y=eq.values, name="净值",
                              line=dict(color=ACCENT)))
     fig.update_layout(height=420, template="plotly_dark",
                       margin=dict(l=20, r=20, t=30, b=20), title=title)
@@ -130,15 +134,15 @@ def equity_chart(equity: pd.Series, title: str = "组合净值"):
 
 def metric_row(m: dict):
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("期末权益", f"{m.get('final_equity', 0):,.0f}")
-    c2.metric("总收益", f"{m.get('total_return', 0) * 100:.1f}%")
-    c3.metric("年化收益", f"{m.get('annual_return', 0) * 100:.1f}%")
-    c4.metric("夏普比率", f"{m.get('sharpe', 0):.2f}")
+    c1.metric("期末权益", safe_num(m.get("final_equity"), 0))
+    c2.metric("总收益", safe_pct(m.get("total_return")))
+    c3.metric("年化收益", safe_pct(m.get("annual_return")))
+    c4.metric("夏普比率", safe_num(m.get("sharpe")))
     c5, c6, c7, c8 = st.columns(4)
-    c5.metric("最大回撤", f"{m.get('max_drawdown', 0) * 100:.1f}%")
-    c6.metric("交易次数", m.get("num_trades", 0))
-    c7.metric("胜率", f"{m.get('win_rate', 0) * 100:.1f}%")
-    c8.metric("超额收益", f"{m.get('excess_return', 0) * 100:.1f}%")
+    c5.metric("最大回撤", safe_pct(m.get("max_drawdown")))
+    c6.metric("交易次数", int(m.get("num_trades", 0) or 0))
+    c7.metric("胜率", safe_pct(m.get("win_rate")))
+    c8.metric("超额收益", safe_pct(m.get("excess_return")))
 
 
 # ---------------- 1. 单标的回测 ----------------
@@ -602,9 +606,11 @@ def page_strategies():
             st.plotly_chart(equity_chart(res["equity"], f"{symbol} · {strat}"))
             m = res["metrics"]
             cc1, cc2, cc3, cc4 = st.columns(4)
-            cc1.metric("累计%", f"{(res['equity'].iloc[-1]/res['equity'].iloc[0]-1)*100:.1f}")
-            cc2.metric("夏普", f"{m['sharpe']:.2f}")
-            cc3.metric("回撤%", f"{m['max_drawdown']*100:.1f}")
+            eq_first = res["equity"].iloc[0]
+            cum = (res["equity"].iloc[-1] / eq_first - 1) if (pd.notna(eq_first) and eq_first != 0) else float("nan")
+            cc1.metric("累计%", safe_pct(cum))
+            cc2.metric("夏普", safe_num(m["sharpe"]))
+            cc3.metric("回撤%", safe_pct(m["max_drawdown"]))
             cc4.metric("换手", f"{res['num_changes']}")
         except Exception as e:
             st.error(f"策略运行失败：{e}")
@@ -660,9 +666,9 @@ def page_factor():
             ev = fe.evaluate(mom, forward=5)
             icv = ic_series(mom, close.pct_change(5).shift(-5), lags=10)
             cc1, cc2, cc3 = st.columns(3)
-            cc1.metric("随机因子IC", f"{ic:.3f}")
-            cc2.metric("动量IC", f"{ev.get('ic', 0):.3f}")
-            cc3.metric("多空收益", f"{ls.iloc[0]:.4f}")
+            cc1.metric("随机因子IC", safe_num(ic, 3))
+            cc2.metric("动量IC", safe_num(ev.get("ic", float("nan")), 3))
+            cc3.metric("多空收益", safe_num(ls.iloc[0] if len(ls) else float("nan"), 4))
             st.line_chart(pd.Series(icv, name="动量IC衰减"))
         except Exception as e:
             st.error(f"因子研究失败：{e}")
