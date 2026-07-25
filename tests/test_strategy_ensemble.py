@@ -107,3 +107,41 @@ def test_invalid_method_rejected():
     e = Ensemble().add("a", FakeStrategy([1] * 10), 1.0)
     with pytest.raises(ValueError):
         e.raw(_df(), "bogus")
+
+
+def test_disjoint_signal_rejected_not_silent():
+    # 隐性修复：信号索引与 df 完全无重叠，原实现会静默产出全 0 信号
+    df = _df()
+    bad_idx = pd.date_range("2099-01-01", periods=10, freq="D")
+    e = Ensemble().add_signal("x", pd.Series(np.ones(10), index=bad_idx), 1.0)
+    with pytest.raises(ValueError):
+        e.raw(df)
+
+
+def test_reweight_by_performance_normalizes():
+    df = _df()
+    fwd = pd.Series(np.ones(10), index=df.index)  # 全上涨：a(全+1)全对，b(全-1)全错
+    e = (Ensemble().add("a", FakeStrategy([1] * 10), 1.0)
+         .add("b", FakeStrategy([-1] * 10), 1.0))
+    e.reweight_by_performance(df, fwd, method="accuracy", alpha=2.0)
+    w = e.weights()
+    assert w["a"] > w["b"]
+    assert abs(sum(w.values()) - 1.0) < 1e-9
+    assert all(v >= 0 for v in w.values())
+
+
+def test_reweight_by_performance_rejects_bad_alpha():
+    df = _df()
+    e = Ensemble().add("a", FakeStrategy([1] * 10), 1.0)
+    with pytest.raises(ValueError):
+        e.reweight_by_performance(df, np.ones(10), alpha=0.0)
+
+
+def test_performance_table_shape():
+    df = _df()
+    fwd = pd.Series(np.ones(10), index=df.index)
+    e = Ensemble().add("a", FakeStrategy([1] * 10), 1.0)
+    t = e.performance_table(df, fwd)
+    assert list(t.columns) == ["member", "weight", "accuracy", "ic", "sharpe"]
+    assert len(t) == 1
+    assert t.iloc[0]["accuracy"] == 1.0
