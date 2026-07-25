@@ -5,6 +5,8 @@ import pytest
 
 from lianghua.execution.slippage import (
     fill_price,
+    market_impact,
+    participation_rate,
     round_trip_cost,
     slippage_cost,
     slippage_fraction,
@@ -86,3 +88,32 @@ def test_round_trip_cost_symmetric():
 
 def test_round_trip_cost_zero_adv():
     assert round_trip_cost(100.0, 1000.0, 0.0, spread=0.1) == pytest.approx(0.1)
+
+
+def test_fill_price_nan_spread_rejected():
+    # 隐性修复：非有限 spread 原会泄漏 NaN 到成交价
+    for bad in (float("nan"), float("inf"), None, "x"):
+        with pytest.raises(ValueError):
+            fill_price(100.0, 1000.0, 1_000_000.0, spread=bad)
+
+
+def test_participation_rate_basic():
+    assert participation_rate(10_000.0, 1_000_000.0) == pytest.approx(0.01)
+    assert participation_rate(10_000.0, 0.0) == 0.0  # 无流动性信息退化
+
+
+def test_market_impact_square_root():
+    # 参与率越高冲击越大（非线性 sqrt），且成本随 sigma 单调增
+    c_low = market_impact(100.0, 1_000.0, 1_000_000.0, sigma=0.02)
+    c_high = market_impact(100.0, 10_000.0, 1_000_000.0, sigma=0.02)
+    assert c_high > c_low
+    c_vol = market_impact(100.0, 10_000.0, 1_000_000.0, sigma=0.05)
+    assert c_vol > c_high
+
+
+def test_market_impact_zero_adv_or_bad_horizon():
+    assert market_impact(100.0, 1000.0, 0.0, sigma=0.02) == 0.0
+    with pytest.raises(ValueError):
+        market_impact(100.0, 1000.0, 1_000_000.0, sigma=0.02, horizon=0.0)
+    with pytest.raises(ValueError):
+        market_impact(100.0, 1000.0, 1_000_000.0, sigma=0.02, eta=-1.0)
