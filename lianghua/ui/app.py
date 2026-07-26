@@ -664,7 +664,7 @@ def page_factor():
             ic = factor_ic(rand_f, fwd)
             mom = fe.compute("momentum_20")
             ev = fe.evaluate(mom, forward=5)
-            icv = ic_series(mom, close.pct_change(5).shift(-5), lags=10)
+            icv = ic_series(mom, close.pct_change(5).shift(-5), window=10)
             cc1, cc2, cc3 = st.columns(3)
             cc1.metric("随机因子IC", safe_num(ic, 3))
             cc2.metric("动量IC", safe_num(ev.get("ic", float("nan")), 3))
