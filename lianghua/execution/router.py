@@ -9,6 +9,8 @@ import datetime as _dt
 import json
 import os
 
+import numpy as np
+
 from .live import LiveEngine, make_live_engine
 from .order_book import OrderBook
 
@@ -20,7 +22,13 @@ class AccountRouter:
         r = routes or {}
         self.by_asset = r.get("by_asset", {})
         self.by_prefix = r.get("by_prefix", {})
-        self.default = r.get("default", default)
+        self.default = r.get("default", default) or default
+        # 校验路由值均为非空字符串，避免路由到 None/非法账户静默失效
+        for scope, mapping in (("by_asset", self.by_asset),
+                               ("by_prefix", self.by_prefix)):
+            for key, acc in mapping.items():
+                if not isinstance(acc, str) or not acc:
+                    raise ValueError(f"路由 {scope}[{key!r}] 必须为非空账户名，收到 {acc!r}")
 
     def route(self, symbol, asset_type) -> str:
         atv = asset_type.value if hasattr(asset_type, "value") else str(asset_type)
@@ -30,6 +38,18 @@ class AccountRouter:
             if str(symbol).startswith(str(pre)):
                 return acc
         return self.default
+
+    def preview(self, symbols) -> dict:
+        """批量路由预览（新增可观测能力）：返回 {symbol: account}。
+
+        asset_type 由 symbol 自动推断（与 MultiLiveEngine._asset_of 同口径），
+        便于在下单前确认每个标的会被分配到哪个账户，而非事后才发现错配。
+        """
+        from ..core.assets import detect_asset_type
+        out: dict = {}
+        for sym in symbols:
+            out[sym] = self.route(sym, detect_asset_type(sym))
+        return out
 
     def __repr__(self):
         return "AccountRouter(by_asset=%s, by_prefix=%s, default=%s)" % (
@@ -101,6 +121,14 @@ class MultiLiveEngine:
         return getattr(self, "last_status",
                        {"accounts": {}, "killed": self.killed})
 
+    def rebalance_status(self) -> dict | None:
+        """返回最近一次 rebalance 的计划快照（新增可观测能力）。
+
+        调用 rebalance() 前返回 None；便于外部在两次再平衡之间读取最新计划，
+        而不必重复触发再平衡副作用（修改 paper/sim 账户 capital）。
+        """
+        return getattr(self, "_last_rebalance", None)
+
     def rebalance(self, target_weights: dict | None = None,
                   write_log: str = "rebalance_log.json") -> dict:
         """跨账户权益再平衡：把每账户 equity 拉向目标权重。
@@ -118,6 +146,12 @@ class MultiLiveEngine:
             is_real = broker_name in ("QmtBroker", "PtBroker")
             rows[name] = {"equity": eq, "engine": eng, "is_real": is_real}
             total += eq
+        if target_weights is not None:
+            if not isinstance(target_weights, dict):
+                raise TypeError("target_weights 必须是 {账户: 权重} 字典")
+            for a, w in target_weights.items():
+                if not np.isfinite(float(w)):
+                    raise ValueError(f"target_weights[{a}] 非有限: {w!r}")
         n = max(len(rows), 1)
         weights = target_weights or {name: 1.0 / n for name in rows}
         plan = []
@@ -194,4 +228,4 @@ def make_multi_engine(config: dict):
                            notify=config.get("notify"))
 
 
-__all__ = ["AccountRouter", "MultiLiveEngine", "make_multi_engine", "rebalance"]
+__all__ = ["AccountRouter", "MultiLiveEngine", "make_multi_engine"]
