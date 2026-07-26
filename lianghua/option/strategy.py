@@ -26,6 +26,8 @@ __all__ = [
     "strangle", "iron_butterfly", "calendar_spread", "ratio_spread",
     "diagonal_spread", "long_call", "long_put",
     "OPTION_COMBO_REGISTRY", "get_option_combo",
+    # 迭代 44 新增
+    "analyze_combo",
 ]
 
 
@@ -110,15 +112,37 @@ def get_option_strategy(name: str, **kwargs) -> OptionStrategyBase:
 # 迭代25：期权组合策略（纯损益计算）
 # ============================================================
 
+_VALID_SIDES = {"buy", "sell"}
+_VALID_OTYPES = {"CALL", "PUT", "STOCK"}
+_VALID_KINDS = {"option", "stock"}
+
+
 class Leg:
     """单个期权腿。side: buy/sell；otype: CALL/PUT。"""
 
     def __init__(self, side: str, otype: str, strike: float, premium: float, kind: str = "option"):
-        self.side = side.lower()          # buy / sell
-        self.otype = otype.upper()         # CALL / PUT
-        self.strike = float(strike)
-        self.premium = float(premium)
-        self.kind = kind.lower()           # option / stock
+        side = str(side).lower()
+        otype = str(otype).upper()
+        kind = str(kind).lower()
+        if side not in _VALID_SIDES:
+            raise ValueError(f"无效 side: {side}，应为 buy/sell")
+        if kind == "stock":
+            otype = "STOCK"
+        if otype not in _VALID_OTYPES:
+            raise ValueError(f"无效 otype: {otype}，应为 CALL/PUT/STOCK")
+        if kind not in _VALID_KINDS:
+            raise ValueError(f"无效 kind: {kind}，应为 option/stock")
+        strike = float(strike)
+        premium = float(premium)
+        if not np.isfinite(strike) or strike < 0:
+            raise ValueError(f"行权价必须 >=0 且有限: {strike}")
+        if not np.isfinite(premium) or premium < 0:
+            raise ValueError(f"权利金必须 >=0 且有限: {premium}")
+        self.side = side                     # buy / sell
+        self.otype = otype                   # CALL / PUT / STOCK
+        self.strike = strike
+        self.premium = premium
+        self.kind = kind                     # option / stock
 
     def intrinsic(self, S: float) -> float:
         if self.kind == "stock":
@@ -139,18 +163,71 @@ class Leg:
 
 def combo_payoff(legs: list[Leg], S: float) -> float:
     """组合在标的价格 S 处的到期损益（已计入净权利金）。"""
+    if not legs:
+        raise ValueError("combo_payoff 至少需要一条腿（legs 为空）")
     return float(sum(leg.pnl(S) for leg in legs))
 
 
 def payoff_curve(legs: list[Leg], S_lo: float, S_hi: float, n: int = 200) -> pd.DataFrame:
     """生成组合到期损益曲线（DataFrame: S, pnl）。"""
+    if not legs:
+        raise ValueError("payoff_curve 至少需要一条腿（legs 为空）")
+    if not np.isfinite(S_lo) or not np.isfinite(S_hi):
+        raise ValueError("S_lo/S_hi 必须为有限数")
+    if S_hi <= S_lo:
+        raise ValueError("S_hi 必须大于 S_lo")
+    n = max(int(n), 2)
     grid = np.linspace(S_lo, S_hi, n)
     pnls = [combo_payoff(legs, s) for s in grid]
     return pd.DataFrame({"S": grid, "pnl": pnls})
 
 
+def analyze_combo(legs: list[Leg], S_lo: float, S_hi: float, n: int = 400) -> dict:
+    """分析组合到期损益结构：最大盈利、最大亏损、盈亏平衡点、净权利金。
+
+    新增能力（此前模块只能构造组合、无法解释其风险收益结构）。
+    - max_profit / max_loss：损益曲线上的极值（inf 表示无界，如裸卖期权）。
+    - breakevens：pnl 由负转正/由正转负的标的价格点列表。
+    - net_premium：建仓净权利金（正数=收租，负数=净支出）。
+    """
+    if not legs:
+        raise ValueError("analyze_combo 至少需要一条腿（legs 为空）")
+    curve = payoff_curve(legs, S_lo, S_hi, n=n)
+    pnls = curve["pnl"].to_numpy()
+    S = curve["S"].to_numpy()
+    finite = np.isfinite(pnls)
+    max_profit = float(np.max(pnls[finite])) if finite.any() else float("inf")
+    max_loss = float(np.min(pnls[finite])) if finite.any() else float("-inf")
+    # 盈亏平衡点：pnl 穿越 0 的位置（线性插值）
+    breakevens = []
+    sign = np.sign(pnls)
+    cross = np.where((sign[:-1] * sign[1:]) < 0)[0]
+    for i in cross:
+        s0, s1 = S[i], S[i + 1]
+        p0, p1 = pnls[i], pnls[i + 1]
+        if p1 == p0:
+            continue
+        b = s0 - p0 * (s1 - s0) / (p1 - p0)
+        breakevens.append(float(b))
+    if not breakevens and finite.any():
+        # 区间内单边不穿越，但若端点在 0 附近也算
+        if abs(pnls[0]) < 1e-9:
+            breakevens.append(float(S[0]))
+        if abs(pnls[-1]) < 1e-9:
+            breakevens.append(float(S[-1]))
+    return {
+        "max_profit": max_profit,
+        "max_loss": max_loss,
+        "breakevens": sorted(breakevens),
+        "net_premium": _prem(legs),
+        "n_legs": len(legs),
+    }
+
+
 def _prem(legs: list[Leg]) -> float:
-    return sum((leg.premium if leg.side == "buy" else -leg.premium) for leg in legs)
+    # 现金流约定：买入腿是现金流出（净支出，记负），卖出腿是现金流入（收租，记正）。
+    # 即 net_premium 为负 = 建仓净支付；为正 = 建仓净收取（收租）。
+    return sum((-leg.premium if leg.side == "buy" else leg.premium) for leg in legs)
 
 
 def vertical_spread(otype: str, low: float, high: float,
