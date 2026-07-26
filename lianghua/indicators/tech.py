@@ -148,3 +148,26 @@ def williams_r(df: pd.DataFrame, period: int = 14) -> pd.Series:
     h = df["high"].astype(float).rolling(period).max()
     l = df["low"].astype(float).rolling(period).min()
     return (h - df["close"].astype(float)) / (h - l + 1e-12) * -100
+
+
+def crossover(a: pd.Series, b: pd.Series) -> pd.Series:
+    """黄金交叉：a 上穿 b（前一根 a<=b 且当前 a>b），返回布尔 Series（首值为 False）。
+
+    信号原语，供均线/指标交叉策略复用；对齐索引后比较，避免错位误判。
+    """
+    a = _as_float(a, "a")
+    b = _as_float(b, "b")
+    a, b = a.align(b, join="outer", fill_value=np.nan)
+    prev = (a < b) | (a <= b)  # 上穿前 a 应在 b 下方
+    cur = a > b
+    return (prev.shift(1).fillna(False)) & cur
+
+
+def crossunder(a: pd.Series, b: pd.Series) -> pd.Series:
+    """死亡交叉：a 下穿 b（前一根 a>=b 且当前 a<b），返回布尔 Series（首值为 False）。"""
+    a = _as_float(a, "a")
+    b = _as_float(b, "b")
+    a, b = a.align(b, join="outer", fill_value=np.nan)
+    prev = (a > b) | (a >= b)
+    cur = a < b
+    return (prev.shift(1).fillna(False)) & cur

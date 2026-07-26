@@ -8,9 +8,13 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+from .tech import _require_cols, _check_period
+
 
 def adx(df, period: int = 14) -> pd.Series:
     """平均趋向指数：趋势强度（不判方向），∈[0,100]，越大趋势越强。"""
+    period = _check_period(period, "period")
+    _require_cols(df, ["high", "low", "close"])
     high, low, close = df["high"], df["low"], df["close"]
     prev_h, prev_l, prev_c = high.shift(), low.shift(), close.shift()
     up = (high - prev_h)
@@ -28,6 +32,7 @@ def adx(df, period: int = 14) -> pd.Series:
 
 def pivot(df) -> pd.DataFrame:
     """经典轴心点：用上一根 K 的 H/L/C 推算 PP 与 R1-S3/S1-S3 支撑阻力。"""
+    _require_cols(df, ["high", "low", "close"])
     h, l, c = df["high"].shift(), df["low"].shift(), df["close"].shift()
     pp = (h + l + c) / 3
     r1 = 2 * pp - l
@@ -42,6 +47,7 @@ def pivot(df) -> pd.DataFrame:
 
 def heikin_ashi(df) -> pd.DataFrame:
     """Heikin-Ashi 平滑 K 线：降低噪声突出趋势。返回 ha_open/high/low/close。"""
+    _require_cols(df, ["open", "high", "low", "close"])
     o, h, l, c = df["open"], df["high"], df["low"], df["close"]
     ha_close = (o + c + h + l) / 4
     ha_open = ha_close.copy()
@@ -55,6 +61,7 @@ def heikin_ashi(df) -> pd.DataFrame:
 
 def renko(df, brick: float | None = None) -> pd.Series:
     """砖形趋势状态：价格每突破一个砖块翻转方向（1 多 / -1 空）。"""
+    _require_cols(df, ["close"])
     close = df["close"].astype(float)
     if brick is None or brick <= 0:
         brick = float((close.max() - close.min()) / 50) or float(close.std() or 1.0)
@@ -74,6 +81,8 @@ def renko(df, brick: float | None = None) -> pd.Series:
 
 def demarker(df, period: int = 14) -> pd.Series:
     """DeMark 动力指标：比较当前与前期高低，∈[0,100]，>0.7 超买 / <0.3 超卖。"""
+    period = _check_period(period, "period")
+    _require_cols(df, ["high", "low"])
     high, low = df["high"], df["low"]
     prev_h, prev_l = high.shift(), low.shift()
     up = (high - prev_h).clip(lower=0)
@@ -85,6 +94,9 @@ def demarker(df, period: int = 14) -> pd.Series:
 
 def klinger(df, fast: int = 34, slow: int = 55) -> pd.Series:
     """Klinger 成交量振荡器：量能趋势（放量上行+/缩量下行-）双均线差。"""
+    fast = _check_period(fast, "fast")
+    slow = _check_period(slow, "slow")
+    _require_cols(df, ["close", "volume"])
     close, vol = df["close"], df["volume"]
     trend = np.where(close > close.shift(), 1.0, -1.0)
     vf = pd.Series(vol.values * trend, index=df.index)
@@ -93,6 +105,8 @@ def klinger(df, fast: int = 34, slow: int = 55) -> pd.Series:
 
 def chaikin_volatility(df, period: int = 10) -> pd.Series:
     """蔡金波动率：价格区间（高-低）的 EMA 变化率，骤升常预示变盘。"""
+    period = _check_period(period, "period")
+    _require_cols(df, ["high", "low"])
     rng = (df["high"] - df["low"])
     ema = rng.ewm(span=period).mean()
     ema_prev = ema.shift(period)
@@ -101,6 +115,8 @@ def chaikin_volatility(df, period: int = 10) -> pd.Series:
 
 def force_index(df, period: int = 13) -> pd.Series:
     """强力指数：价格变动 × 成交量，EMA 平滑，反映资金推动强度。"""
+    period = _check_period(period, "period")
+    _require_cols(df, ["close", "volume"])
     c, v = df["close"].astype(float), df["volume"].astype(float)
     fi = (c.diff() * v)
     return fi.ewm(span=period).mean().rename("force_index")
@@ -108,6 +124,9 @@ def force_index(df, period: int = 13) -> pd.Series:
 
 def know_sure_thing(df, r1: int = 10, r2: int = 15, r3: int = 20, r4: int = 30) -> pd.Series:
     """KST 已知善恶指标：多周期 ROC 加权的趋势综合动能。"""
+    for nm, v in (("r1", r1), ("r2", r2), ("r3", r3), ("r4", r4)):
+        _check_period(v, nm)
+    _require_cols(df, ["close"])
     c = df["close"].astype(float)
     roc1 = c.pct_change(r1).rolling(r1).mean()
     roc2 = c.pct_change(r2).rolling(r2).mean()
@@ -119,6 +138,9 @@ def know_sure_thing(df, r1: int = 10, r2: int = 15, r3: int = 20, r4: int = 30) 
 
 def zigzag(df, pct: float = 0.05) -> pd.Series:
     """之字转向：价格相对极值反向突破 pct 时翻转方向（1 多 / -1 空）。"""
+    if not isinstance(pct, (int, float)) or pct <= 0:
+        raise ValueError(f"zigzag 的 pct 必须为正数，收到 {pct!r}")
+    _require_cols(df, ["close"])
     close = df["close"].astype(float)
     last_ext = float(close.iloc[0])
     last_dir = 0
@@ -134,6 +156,8 @@ def zigzag(df, pct: float = 0.05) -> pd.Series:
 
 def price_channels(df, period: int = 20) -> pd.DataFrame:
     """价格通道：N 日最高价（上轨）与最低价（下轨）构成的轨道。"""
+    period = _check_period(period, "period")
+    _require_cols(df, ["high", "low"])
     upper = df["high"].rolling(period).max()
     lower = df["low"].rolling(period).min()
     return pd.DataFrame({"upper": upper, "lower": lower})

@@ -10,12 +10,13 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+from .tech import _require_cols, _check_period
+
 
 def _wma(s, n: int) -> pd.Series:
     """加权移动平均（线性权重 1..n），窗口固定为 n。"""
     s = pd.Series(s).astype(float)
-    if n < 1:
-        n = 1
+    n = _check_period(n, "n")
     return s.rolling(n).apply(
         lambda x: np.dot(x, np.arange(1, n + 1)) / (n * (n + 1) / 2), raw=True
     )
@@ -23,6 +24,8 @@ def _wma(s, n: int) -> pd.Series:
 
 def keltner_channels(df, period: int = 20, mult: float = 2.0) -> pd.DataFrame:
     """肯特纳通道：中轨=EMA(close)，上下轨=中轨±mult×ATR。"""
+    period = _check_period(period, "period")
+    _require_cols(df, ["high", "low", "close"])
     close = df["close"]
     high = df["high"]
     low = df["low"]
@@ -39,6 +42,8 @@ def keltner_channels(df, period: int = 20, mult: float = 2.0) -> pd.DataFrame:
 
 def donchian_channel(df, period: int = 20) -> pd.DataFrame:
     """唐奇安通道：上轨=N 日最高，下轨=N 日最低，中轨=均值。"""
+    period = _check_period(period, "period")
+    _require_cols(df, ["high", "low"])
     high = df["high"]
     low = df["low"]
     upper = high.rolling(period).max()
@@ -49,6 +54,7 @@ def donchian_channel(df, period: int = 20) -> pd.DataFrame:
 
 def hull_moving_average(close, period: int = 20) -> pd.Series:
     """赫尔移动平均：对 WMA 差再做短窗 WMA，更跟势且滞后更小。"""
+    period = _check_period(period, "period")
     close = pd.Series(close).astype(float)
     half = max(period // 2, 1)
     sqrt_p = max(int(np.sqrt(period)), 1)
@@ -61,6 +67,8 @@ def hull_moving_average(close, period: int = 20) -> pd.Series:
 
 def true_strength_index(close, r: int = 25, s: int = 13) -> pd.Series:
     """真实强弱指数(TSI)：双平滑动量 / 双平滑绝对动量，∈(-100,100)。"""
+    r = _check_period(r, "r")
+    s = _check_period(s, "s")
     close = pd.Series(close).astype(float)
     m = close.diff()
     absm = m.abs()
@@ -74,6 +82,8 @@ def true_strength_index(close, r: int = 25, s: int = 13) -> pd.Series:
 
 def chandelier_exit(df, period: int = 22, mult: float = 3.0) -> pd.DataFrame:
     """吊灯止损：多头退场=近 N 高 - mult×ATR；空头退场=近 N 低 + mult×ATR。"""
+    period = _check_period(period, "period")
+    _require_cols(df, ["high", "low", "close"])
     high = df["high"]
     low = df["low"]
     close = df["close"]
@@ -99,6 +109,8 @@ def zscore(close, period: int = 20) -> pd.Series:
 
 def ease_of_movement(df, period: int = 14) -> pd.Series:
     """简易波动指标(EMV)：价格区间中点变动 / 成交量箱宽，平滑后反映量价推力。"""
+    period = _check_period(period, "period")
+    _require_cols(df, ["high", "low", "volume"])
     high = df["high"]
     low = df["low"]
     vol = df["volume"]
@@ -112,6 +124,9 @@ def ease_of_movement(df, period: int = 14) -> pd.Series:
 
 def mass_index(df, period: int = 9, sum_period: int = 25) -> pd.Series:
     """质量指数：双平滑(高-低)之比的累计和，用于预警趋势反转。"""
+    period = _check_period(period, "period")
+    sum_period = _check_period(sum_period, "sum_period")
+    _require_cols(df, ["high", "low"])
     high = df["high"]
     low = df["low"]
     e = (high - low)

@@ -9,7 +9,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from .tech import atr, rsi, macd
+from .tech import atr, rsi, macd, _require_cols, _check_period, _as_float
 
 
 def supertrend(df: pd.DataFrame, period: int = 10, mult: float = 3.0) -> pd.DataFrame:
@@ -17,6 +17,8 @@ def supertrend(df: pd.DataFrame, period: int = 10, mult: float = 3.0) -> pd.Data
 
     返回 DataFrame(st=趋势线, dir=方向 +1 多 / -1 空)。
     """
+    period = _check_period(period, "period")
+    _require_cols(df, ["high", "low", "close"])
     h = df["high"].astype(float)
     l = df["low"].astype(float)
     c = df["close"].astype(float)
@@ -46,6 +48,8 @@ def supertrend(df: pd.DataFrame, period: int = 10, mult: float = 3.0) -> pd.Data
 
 def aroon(df: pd.DataFrame, period: int = 25) -> pd.DataFrame:
     """Aroon 指标：衡量距最高/最低点的时间距离。返回 up/down (0-100)。"""
+    period = _check_period(period, "period")
+    _require_cols(df, ["high", "low"])
     h = df["high"].astype(float)
     l = df["low"].astype(float)
 
@@ -62,6 +66,8 @@ def aroon(df: pd.DataFrame, period: int = 25) -> pd.DataFrame:
 
 def vortex(df: pd.DataFrame, period: int = 14) -> pd.DataFrame:
     """Vortex 指标：VI+ / VI- 衡量趋势方向强度。"""
+    period = _check_period(period, "period")
+    _require_cols(df, ["high", "low", "close"])
     h = df["high"].astype(float)
     l = df["low"].astype(float)
     c = df["close"].astype(float)
@@ -77,6 +83,8 @@ def vortex(df: pd.DataFrame, period: int = 14) -> pd.DataFrame:
 
 def trix(series: pd.Series, period: int = 15, signal: int = 9) -> pd.DataFrame:
     """TRIX：三重指数平滑变化率。返回 trix 与 signal 线（百分比）。"""
+    period = _check_period(period, "period")
+    signal = _check_period(signal, "signal")
     c = series.astype(float)
     e1 = c.ewm(span=period, adjust=False).mean()
     e2 = e1.ewm(span=period, adjust=False).mean()
@@ -88,6 +96,8 @@ def trix(series: pd.Series, period: int = 15, signal: int = 9) -> pd.DataFrame:
 
 def williams_r(df: pd.DataFrame, period: int = 14) -> pd.Series:
     """Williams %R：范围 -100..0，越接近 0 越超买。"""
+    period = _check_period(period, "period")
+    _require_cols(df, ["high", "low", "close"])
     h = df["high"].astype(float).rolling(period).max()
     l = df["low"].astype(float).rolling(period).min()
     c = df["close"].astype(float)
@@ -96,6 +106,8 @@ def williams_r(df: pd.DataFrame, period: int = 14) -> pd.Series:
 
 def cmf(df: pd.DataFrame, period: int = 20) -> pd.Series:
     """Chaikin Money Flow：量价资金流强度，范围约 -1..1。"""
+    period = _check_period(period, "period")
+    _require_cols(df, ["high", "low", "close"])
     h = df["high"].astype(float)
     l = df["low"].astype(float)
     c = df["close"].astype(float)
@@ -107,6 +119,8 @@ def cmf(df: pd.DataFrame, period: int = 20) -> pd.Series:
 
 def mfi(df: pd.DataFrame, period: int = 14) -> pd.Series:
     """Money Flow Index：量价加权 RSI，范围 0..100。"""
+    period = _check_period(period, "period")
+    _require_cols(df, ["high", "low", "close"])
     h = df["high"].astype(float)
     l = df["low"].astype(float)
     c = df["close"].astype(float)
@@ -122,6 +136,9 @@ def mfi(df: pd.DataFrame, period: int = 14) -> pd.Series:
 
 def stoch_rsi(series: pd.Series, period: int = 14, k: int = 3, d: int = 3) -> pd.DataFrame:
     """Stochastic RSI：对 RSI 再做随机指标，范围 0..1。返回 k/d。"""
+    period = _check_period(period, "period")
+    k = _check_period(k, "k")
+    d = _check_period(d, "d")
     r = rsi(series, period)
     lo = r.rolling(period).min()
     hi = r.rolling(period).max()
@@ -133,6 +150,7 @@ def stoch_rsi(series: pd.Series, period: int = 14, k: int = 3, d: int = 3) -> pd
 
 def dpo(series: pd.Series, period: int = 20) -> pd.Series:
     """Detrended Price Oscillator：去趋势价格振荡，识别周期。"""
+    period = _check_period(period, "period")
     c = series.astype(float)
     ma = c.rolling(period).mean()
     shift = period // 2 + 1
@@ -141,6 +159,9 @@ def dpo(series: pd.Series, period: int = 20) -> pd.Series:
 
 def ppo(series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9) -> pd.DataFrame:
     """Percentage Price Oscillator：MACD 的百分比版本（跨标的可比）。"""
+    fast = _check_period(fast, "fast")
+    slow = _check_period(slow, "slow")
+    signal = _check_period(signal, "signal")
     c = series.astype(float)
     ef = c.ewm(span=fast, adjust=False).mean()
     es = c.ewm(span=slow, adjust=False).mean()
