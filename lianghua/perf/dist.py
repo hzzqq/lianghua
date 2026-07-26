@@ -26,7 +26,8 @@ def tail_ratio(equity: pd.Series, quantile: float = 0.05) -> float:
         return 0.0
     up = abs(r.quantile(1 - quantile))
     dn = abs(r.quantile(quantile))
-    return float(up / dn) if dn > 0 else float("inf")
+    # 左尾为 0 时用 1e-12 兜底，避免向上游泄漏 inf（与全库其它比率处理一致）
+    return float(up / (dn + 1e-12))
 
 
 def value_at_risk(equity: pd.Series, alpha: float = 0.95) -> float:

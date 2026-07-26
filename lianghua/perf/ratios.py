@@ -43,9 +43,12 @@ def gain_to_pain(equity: pd.Series) -> float:
 def cagr(equity: pd.Series, annual: int = 252) -> float:
     """年化复合增长率（按数据点数折算）。"""
     e = equity.astype(float)
-    if len(e) < 2 or e.iloc[0] <= 0:
+    if len(e) < 2 or e.iloc[0] <= 0 or annual <= 0:
         return 0.0
     total = e.iloc[-1] / e.iloc[0]
+    # 净值跌破/归零时 total<=0，负底数做分数幂会抛 ValueError；此处安全降级为 0.0
+    if total <= 0:
+        return 0.0
     years = len(e) / annual
     if years <= 0:
         return 0.0
@@ -121,3 +124,36 @@ def tail_ratio(returns) -> float:
     right = r[r > r.quantile(0.95)].mean()
     left = -r[r < r.quantile(0.05)].mean()
     return float(right / (left + 1e-12))
+
+
+def summary(equity: pd.Series, benchmark: pd.Series | None = None) -> dict:
+    """一次性汇总常用绩效比率，所有值经安全化（无 NaN/inf），可直接落库/出报告。
+
+    新需求：把分散的比率函数聚合成一份「可观测、可序列化」的绩效快照。
+    含 CAGR / 年化波动 / 最大回撤 / Calmar / 溃疡 / 收益痛苦比 / 尾部比，
+    给定基准时附上/下行捕获比。所有除零均经 +1e-12 或显式守卫，避免污染下游。
+    """
+    e = equity.astype(float)
+    r = _returns(e)
+    ann_vol = float(r.std() * np.sqrt(252)) if len(r) else 0.0
+    peak = e.cummax()
+    mdd = float((e / peak - 1.0).min())
+    out = {
+        "cagr": cagr(e),
+        "annual_vol": ann_vol,
+        "max_drawdown": mdd,
+        "calmar": calmar_ratio(e),
+        "ulcer_index": ulcer_index(e),
+        "gain_to_pain": gain_to_pain(e),
+        "tail_ratio": tail_ratio(r),
+        "k_ratio": k_ratio(e),
+    }
+    if benchmark is not None:
+        cap = up_down_capture(e, benchmark)
+        out["up_capture"] = cap["up_capture"]
+        out["down_capture"] = cap["down_capture"]
+    # 安全清洗：任何 NaN/inf 回落为 0.0，保证序列化安全
+    for k, v in out.items():
+        if not np.isfinite(v):
+            out[k] = 0.0
+    return out

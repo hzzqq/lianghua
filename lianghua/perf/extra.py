@@ -83,9 +83,11 @@ def return_kurtosis(returns) -> float:
 
 
 def _aligned(equity: pd.Series, benchmark) -> tuple:
-    r = _returns(equity)
+    r = _returns(equity).dropna()
     b = pd.Series(benchmark).astype(float)
     b = b if (b > 1.5).mean() < 0.5 else b.pct_change()
+    # 隐性修复：基准含 NaN 时 np.cov 会产出 NaN beta/alpha；先剔除缺失再对齐
+    b = b.dropna()
     idx = r.index.intersection(b.index)
     return r.loc[idx], b.loc[idx]
 
