@@ -15,6 +15,9 @@ def marginal_var(returns: pd.DataFrame, weights, alpha: float = 0.05) -> pd.Seri
     """边际 VaR：组合 VaR 对各资产权重的偏导数（近似），∑w·MVaR=组合 VaR。"""
     w = np.asarray(weights, dtype=float)
     cov = returns.cov().values
+    if not np.isfinite(cov).all():
+        # 隐性修复：收益含 NaN 时协方差矩阵非有限，避免污染下游 VaR 分解
+        return pd.Series(0.0, index=returns.columns)
     port_vol = np.sqrt(max(float(w @ cov @ w), 1e-12))
     mctr = (cov @ w) / port_vol
     z = _norm_ppf(alpha)
@@ -26,6 +29,8 @@ def incremental_var(returns: pd.DataFrame, weights, alpha: float = 0.05,
     """增量 VaR：把每个资产权重微调 eps 后组合 VaR 的变化（一阶近似）。"""
     w = np.asarray(weights, dtype=float)
     cov = returns.cov().values
+    if not np.isfinite(cov).all():
+        return pd.Series(0.0, index=returns.columns)
     port_vol = np.sqrt(max(float(w @ cov @ w), 1e-12))
     z = _norm_ppf(alpha)
     base_var = -z * port_vol
@@ -61,9 +66,12 @@ def portfolio_beta(returns: pd.DataFrame, weights, market) -> float:
     pr = pd.Series(port, index=R.index)
     idx = pr.index.intersection(m.index)
     pr, m = pr.loc[idx], m.loc[idx]
-    if len(pr) < 2:
+    if len(pr) < 2 or m.notna().sum() < 2:
+        # 隐性修复：基准与组合无有效重叠时 np.cov 会产出 NaN；此处安全降级为 0.0
         return 0.0
     cov = np.cov(pr.values, m.values)
+    if not np.isfinite(cov).all():
+        return 0.0
     return float(cov[0, 1] / (cov[1, 1] + 1e-12))
 
 
@@ -101,6 +109,8 @@ def conditional_beta(returns: pd.DataFrame, weights, market, alpha: float = 0.05
     if tail.sum() < 5:
         return portfolio_beta(returns, weights, market)
     cov = np.cov(pr[tail].values, m[tail].values)
+    if not np.isfinite(cov).all():
+        return portfolio_beta(returns, weights, market)
     return float(cov[0, 1] / (cov[1, 1] + 1e-12))
 
 

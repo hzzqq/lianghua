@@ -31,8 +31,29 @@ class CostModel:
         comm = notional * self.commission_rate + self.fixed_fee
         imp = notional * self.impact
         fee = slip + comm + imp
-        tax = notional * self.stamp_tax if side in ("SELL", "SHORT", "COVER") else 0.0
+        # 印花税仅对卖出/开空征收；COVER(平空)是买入，不应缴印花税（隐性语义错误已修正）
+        tax = notional * self.stamp_tax if side in ("SELL", "SHORT") else 0.0
         return max(fee + tax, self.min_fee)
+
+    def breakdown(self, side: str, price: float, size: float, multiplier: float = 1.0) -> dict:
+        """拆解该笔交易各项成本（佣金/滑点/冲击/印花税/固定费/合计），便于成本归因。
+
+        新需求：把混合成本透明化，方便回测/实盘复盘每笔交易的摩擦来源。
+        """
+        notional = abs(price * size * multiplier)
+        slip = notional * self.slippage
+        comm = notional * self.commission_rate + self.fixed_fee
+        imp = notional * self.impact
+        tax = notional * self.stamp_tax if side in ("SELL", "SHORT") else 0.0
+        total = max(slip + comm + imp + tax, self.min_fee)
+        return {
+            "notional": round(notional, 4),
+            "slippage": round(slip, 4),
+            "commission": round(comm, 4),
+            "impact": round(imp, 4),
+            "stamp_tax": round(tax, 4),
+            "total": round(total, 4),
+        }
 
 
 # 预设（贴近 A 股/期货/期权/基金常见费率）
