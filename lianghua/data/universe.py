@@ -33,4 +33,29 @@ def get_universe(name: str) -> list[str]:
     return list(UNIVERSES[name])
 
 
-__all__ = ["UNIVERSES", "list_universes", "get_universe"]
+def in_universe(name: str, symbol: str) -> bool:
+    """判定 symbol 是否属于指定 universe（成分股筛选原子能力）。"""
+    if name not in UNIVERSES:
+        raise ValueError(f"未知 universe: {name}，可选 {list_universes()}")
+    return symbol in UNIVERSES[name]
+
+
+def union(names: list[str] | None = None) -> list[str]:
+    """多个 universe 的去重并集；不传则返回全部 universe 的去重并集。
+
+    用于构建跨板块/宽基股票池，去重保证同一标的不会被重复纳入。
+    """
+    keys = names if names is not None else list(UNIVERSES.keys())
+    out: list[str] = []
+    seen: set[str] = set()
+    for k in keys:
+        if k not in UNIVERSES:
+            raise ValueError(f"未知 universe: {k}，可选 {list_universes()}")
+        for s in UNIVERSES[k]:
+            if s not in seen:
+                seen.add(s)
+                out.append(s)
+    return out
+
+
+__all__ = ["UNIVERSES", "list_universes", "get_universe", "in_universe", "union"]

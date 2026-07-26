@@ -4,7 +4,7 @@ from __future__ import annotations
 import pandas as pd
 
 _BASE = ["open", "high", "low", "close"]
-_VOL_ALIASES = ("volume", "vol", "Volume", "VOL", "amount", " turnover")
+_VOL_ALIASES = ("volume", "vol", "Volume", "VOL", "amount", "turnover")
 
 
 def _resolve_volume(df):
