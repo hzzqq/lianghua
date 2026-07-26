@@ -11,6 +11,8 @@ v2 改进：
 """
 from __future__ import annotations
 
+import warnings
+
 import numpy as np
 import pandas as pd
 
@@ -22,7 +24,12 @@ def _check_returns(returns: pd.DataFrame) -> pd.DataFrame:
         raise ValueError("returns 至少需要一个资产列")
     if returns.shape[0] < 2:
         raise ValueError("returns 至少需要 2 行收益才能估计协方差/波动")
-    return returns.dropna(how="any")
+    # 隐性修复：dropna 仅剔除 NaN，会把 inf/-inf 漏进来污染协方差/标准差，
+    # 进而静默产出 inf/NaN 权重且零报错。这里同时过滤非有限值。
+    r = returns.replace([np.inf, -np.inf], np.nan).dropna(how="any")
+    if r.shape[0] < 2:
+        raise ValueError("returns 含过多非有限值，至少需要 2 行有限观测值")
+    return r
 
 
 def equal_weight(returns: pd.DataFrame) -> pd.Series:
@@ -101,18 +108,68 @@ def risk_contributions(weights: pd.Series, returns: pd.DataFrame) -> pd.Series:
     """各资产对组合方差的风险贡献占比（非负权重下和为 1）。
 
     贡献_i = w_i * (Σw)_i / (wᵀΣw)。用于诊断集中度——理想风险平价下各贡献应相等。
+
+    隐性修复：原实现用 np.asarray(weights) 直接按位置映射到 returns 列，
+    若 weights 的索引顺序/标签与 returns.columns 不一致，贡献会被错贴到错误的资产上
+    （静默、无报错）。现按列名对齐权重。
     """
-    w = np.asarray(weights, dtype=float)
-    r = returns.dropna(how="any")
-    if r.shape[0] < 2 or w.sum() == 0:
-        return pd.Series(np.nan, index=returns.columns)
+    w = weights if isinstance(weights, pd.Series) else pd.Series(weights)
+    r = returns.replace([np.inf, -np.inf], np.nan).dropna(how="any")
+    if r.shape[0] < 2:
+        return pd.Series(np.nan, index=r.columns)
+    # 按 returns 列名对齐权重，缺失列视为 0 配置
+    w = w.reindex(r.columns).fillna(0.0)
+    wv = np.asarray(w, dtype=float)
+    if not np.all(np.isfinite(wv)) or wv.sum() == 0:
+        return pd.Series(np.nan, index=r.columns)
     cov = r.cov().values
-    port_var = float(w @ cov @ w)
+    port_var = float(wv @ cov @ wv)
     if port_var <= 0:
-        return pd.Series(np.nan, index=returns.columns)
-    mrc = cov @ w
-    contrib = (w * mrc) / port_var
-    return pd.Series(contrib, index=returns.columns)
+        return pd.Series(np.nan, index=r.columns)
+    mrc = cov @ wv
+    contrib = (wv * mrc) / port_var
+    return pd.Series(contrib, index=r.columns)
+
+
+def portfolio_volatility(weights: pd.Series, returns: pd.DataFrame) -> float:
+    """组合年化波动率（默认按 sqrt(252) 缩放，与原模块年化口径一致）。
+
+    new_requirement（新增能力）：组合风险的总量视图，与 risk_contributions（结构视图）
+    互补；权重按列名对齐，缺失列视为 0 配置。
+    """
+    w = weights if isinstance(weights, pd.Series) else pd.Series(weights)
+    r = returns.replace([np.inf, -np.inf], np.nan).dropna(how="any")
+    if r.shape[0] < 2:
+        raise ValueError("returns 至少需要 2 行有限收益以估计协方差")
+    w = w.reindex(r.columns).fillna(0.0)
+    wv = np.asarray(w, dtype=float)
+    if not np.all(np.isfinite(wv)):
+        raise ValueError("weights 含非有限值")
+    cov = r.cov().values
+    var = float(wv @ cov @ wv)
+    if var <= 0:
+        return 0.0
+    return float(np.sqrt(var) * np.sqrt(252.0))
+
+
+def effective_bets(weights: pd.Series, returns: pd.DataFrame) -> float:
+    """有效独立下注数（Meucci 熵口径）。
+
+    new_requirement（新增能力，机构风险诊断标配）：对相关性矩阵做特征值分解，
+    p_i = λ_i / Σλ，E_NB = exp(-Σ p_i ln p_i)。E_NB 越接近资产数代表分散越充分、
+    相关性越低；越接近 1 代表风险高度集中于少数共同因子。权重按列名对齐。
+    """
+    w = weights if isinstance(weights, pd.Series) else pd.Series(weights)
+    r = returns.replace([np.inf, -np.inf], np.nan).dropna(how="any")
+    if r.shape[1] < 2:
+        return 1.0
+    corr = r.corr().values
+    corr = np.nan_to_num(corr, nan=0.0, posinf=1.0, neginf=0.0)
+    eig = np.linalg.eigvalsh(np.clip(corr, -1.0, 1.0))
+    eig = np.clip(eig, 1e-12, None)  # 相关性矩阵数值误差可能给出极小负值
+    p = eig / eig.sum()
+    # 熵口径有效数：exp(-Σ p ln p)
+    return float(np.exp(-np.sum(p * np.log(p))))
 
 
 def _apply_max_weight(w: np.ndarray, cap: float | None) -> np.ndarray:
@@ -158,6 +215,29 @@ def optimize(returns: pd.DataFrame, method: str = "risk_parity",
 
 
 def portfolio_returns(weights: pd.Series, asset_returns: pd.DataFrame) -> pd.Series:
-    """由权重与资产日收益得到组合日收益序列。"""
-    aligned = asset_returns.reindex(columns=weights.index).fillna(0.0)
-    return (aligned * weights).sum(axis=1)
+    """由权重与资产日收益得到组合日收益序列。
+
+    隐性修复：原实现用 asset_returns.reindex(columns=weights.index).fillna(0.0)，
+    当 weights 含 asset_returns 不存在的列时，该列被静默填 0（配置凭空消失）
+    且不归一化（权重和 ≠ 1 时权重语义失真）。现改为：把权重对齐到实际资产列、
+    缺失列视为 0 配置，并对权重归一化；若 weights 存在资产侧没有的列，发出
+    UserWarning 以便观测被丢弃的配置。
+    """
+    w = weights if isinstance(weights, pd.Series) else pd.Series(weights)
+    missing = [c for c in w.index if c not in asset_returns.columns]
+    if missing:
+        warnings.warn(
+            f"portfolio_returns: 权重含 {len(missing)} 个资产侧不存在的列"
+            f"（如 {missing[:3]}），其配置将被忽略",
+            UserWarning,
+        )
+    aligned_w = w.reindex(asset_returns.columns).fillna(0.0)
+    s = float(aligned_w.sum())
+    if s <= 0 or not np.isfinite(s):
+        # 权重全为空/非有限：退化为等权，避免全 0 序列
+        aligned_w = pd.Series(np.ones(asset_returns.shape[1]) / max(asset_returns.shape[1], 1),
+                              index=asset_returns.columns)
+    else:
+        aligned_w = aligned_w / s
+    aligned = asset_returns.reindex(columns=aligned_w.index).fillna(0.0)
+    return (aligned * aligned_w).sum(axis=1)
