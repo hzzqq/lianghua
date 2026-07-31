@@ -87,6 +87,23 @@ def _load_mod_funcs(pkg_name: str) -> dict:
 
 PERF_FUNCS = _load_mod_funcs("lianghua.perf")
 RISK_FUNCS = _load_mod_funcs("lianghua.risk")
+
+
+def gw_fetch(gw, symbol, start, end, asset=None, **kw):
+    """取数并检测是否被静默降级为演示(假)数据。
+
+    返回 ``(df, warn)``：``warn`` 为非空字符串时说明真实行情获取失败、
+    已自动用演示数据兜底，调用方应主动 ``st.warning(warn)`` 提示用户，
+    避免拿假数据跑出的回测/分析结果被误当成真实行情结论。
+    """
+    df = gw.fetch(symbol, start, end, asset=asset, **kw)
+    warn = ""
+    if getattr(gw, "last_was_demo", False):
+        warn = ("⚠️ 标的 %s 真实行情获取失败，已自动降级为演示(假)数据；"
+                "本页结果仅供功能演示，不代表真实行情。" % symbol)
+    return df, warn
+
+
 from lianghua.data.gateway import DataGateway
 from lianghua.execution.live import LiveEngine, make_live_engine
 from lianghua.execution.order_book import OrderBook
@@ -324,8 +341,10 @@ def page_future_spread():
         from lianghua.data.gateway import DataGateway
         gw = DataGateway()
         with st.spinner("拉取近/远月数据..."):
-            near_df = gw.fetch(near, str(start), str(end), asset=AssetType.FUTURE)
-            far_df = gw.fetch(far, str(start), str(end), asset=AssetType.FUTURE)
+            near_df, _w = gw_fetch(gw, near, str(start), str(end), asset=AssetType.FUTURE)
+            if _w: st.warning(_w)
+            far_df, _w = gw_fetch(gw, far, str(start), str(end), asset=AssetType.FUTURE)
+            if _w: st.warning(_w)
         if near_df.empty or far_df.empty:
             st.error("近月或远月数据为空")
             return
@@ -358,7 +377,8 @@ def page_fund():
         navs = {}
         with st.spinner("拉取基金净值..."):
             for code in codes:
-                df = gw.fetch(code, str(start), str(end), asset=AssetType.FUND)
+                df, _w = gw_fetch(gw, code, str(start), str(end), asset=AssetType.FUND)
+                if _w: st.warning(_w)
                 if not df.empty:
                     navs[code] = df.set_index("date")["close"].astype(float)
         if not navs:
@@ -418,7 +438,8 @@ def page_vectorized():
     if st.button("▶ 运行向量化回测", type="primary", key="vb_run"):
         from lianghua.data.gateway import DataGateway
         gw = DataGateway()
-        df = gw.fetch(symbol, str(start), str(end), asset=AssetType.STOCK)
+        df, _w = gw_fetch(gw, symbol, str(start), str(end), asset=AssetType.STOCK)
+        if _w: st.warning(_w)
         sig = reg_get_strategy(strategy).generate_signals(df)
         r = vectorized_backtest(df, sig, init_cash=init_cash, cost_rate=cost_rate)
         metric_row(r["metrics"])
@@ -517,7 +538,8 @@ def page_param():
     if st.button("▶ 开始优化", type="primary", key="pa_run"):
         from lianghua.data.gateway import DataGateway
         gw = DataGateway()
-        df = gw.fetch(symbol, str(start), str(end), asset=AssetType.STOCK)
+        df, _w = gw_fetch(gw, symbol, str(start), str(end), asset=AssetType.STOCK)
+        if _w: st.warning(_w)
         if df.empty:
             st.error("数据为空")
             return
@@ -597,7 +619,8 @@ def page_strategies():
     if st.button("生成信号", key="sl_run"):
         try:
             gw = DataGateway()
-            df = gw.fetch(symbol, start, end, asset=AssetType.STOCK)
+            df, _w = gw_fetch(gw, symbol, start, end, asset=AssetType.STOCK)
+            if _w: st.warning(_w)
             if df.empty:
                 st.error("无数据（离线降级演示）")
                 return
@@ -653,7 +676,8 @@ def page_factor():
     if st.button("运行因子研究"):
         try:
             gw = DataGateway()
-            df = gw.fetch(symbol, start, end, asset=AssetType.STOCK)
+            df, _w = gw_fetch(gw, symbol, start, end, asset=AssetType.STOCK)
+            if _w: st.warning(_w)
             close = df.set_index("date")["close"]
             # 演示：用内置因子引擎 + 随机因子
             fe = FactorEngine(df)
@@ -684,7 +708,9 @@ def page_indicator_lab():
     end = str(st.date_input("结束", datetime.date(2023, 12, 31), key="il_end"))
     if st.button("▶ 运行指标", key="il_run"):
         try:
-            df = DataGateway().fetch(symbol, start, end, asset=AssetType.STOCK)
+            gw = DataGateway()
+            df, _w = gw_fetch(gw, symbol, start, end, asset=AssetType.STOCK)
+            if _w: st.warning(_w)
             if df is None or df.empty:
                 st.error("无数据（离线降级演示）")
                 return
@@ -725,7 +751,9 @@ def page_perf_risk():
     end = str(st.date_input("结束", datetime.date(2023, 12, 31), key="pr_end"))
     if st.button("▶ 运行", key="pr_run"):
         try:
-            df = DataGateway().fetch(symbol, start, end, asset=AssetType.STOCK)
+            gw = DataGateway()
+            df, _w = gw_fetch(gw, symbol, start, end, asset=AssetType.STOCK)
+            if _w: st.warning(_w)
             if df is None or df.empty:
                 st.error("无数据（离线降级演示）")
                 return
