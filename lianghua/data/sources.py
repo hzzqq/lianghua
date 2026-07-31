@@ -9,8 +9,12 @@
 from __future__ import annotations
 
 import hashlib
+import time
 import numpy as np
 import pandas as pd
+
+# 各源最近一次失败原因，供 UI/调用方主动提示（避免"无数据"三连却不知为何）
+_LAST_ERRORS: dict[str, str] = {}
 
 
 def _synth_frame(symbol: str, start: str, end: str, seed: int = 0) -> pd.DataFrame:
@@ -164,23 +168,53 @@ def make_source(name: str) -> BaseSource:
     return REGISTRY[name]()
 
 
-def fetch_from(name: str, symbol: str, start: str, end: str, asset: str = "stock"):
-    """从指定源取数；该源不可用或失败返回 None。"""
-    return make_source(name).fetch(symbol, start, end, asset)
+def fetch_from(name: str, symbol: str, start: str, end: str, asset: str = "stock",
+               retries: int = 0, backoff: float = 0.0) -> pd.DataFrame | None:
+    """从指定源取数；该源不可用或失败返回 None。
+
+    retries/backoff: 真实源（akshare/baostock）取数时按 ``retries`` 次重试，
+        间隔 ``backoff`` 秒（默认不重试），扛瞬时网络抖动。每次失败原因记入
+        ``_LAST_ERRORS[name]``，可由 ``last_error(name)`` 取出主动提示用户。
+    """
+    src = make_source(name)
+    attempts = max(1, int(retries) + 1)
+    last_exc: Exception | None = None
+    for i in range(attempts):
+        try:
+            df = src.fetch(symbol, start, end, asset)
+            if df is not None and not (isinstance(df, pd.DataFrame) and df.empty):
+                _LAST_ERRORS.pop(name, None)
+                return df
+        except Exception as exc:  # noqa: BLE001 - 真实源异常需记录后降级
+            last_exc = exc
+        if i < attempts - 1 and backoff > 0:
+            time.sleep(backoff)
+    if last_exc is not None:
+        _LAST_ERRORS[name] = f"{type(last_exc).__name__}: {last_exc}"
+    else:
+        _LAST_ERRORS[name] = "返回空（依赖缺失或无数据）"
+    return None
 
 
 def fetch_any(symbol: str, start: str, end: str, asset: str = "stock",
-              order: list[str] | None = None) -> pd.DataFrame | None:
-    """按优先级尝试多个源，返回第一个非空 DataFrame（全失败返回 None）。"""
+              order: list[str] | None = None,
+              retries: int = 0, backoff: float = 0.0) -> pd.DataFrame | None:
+    """按优先级尝试多个源，返回第一个非空 DataFrame（全失败返回 None）。
+
+    retries/backoff 透传给每个源（见 ``fetch_from``）；单源失败原因记入
+    ``_LAST_ERRORS``，便于排障。
+    """
     order = order or ["akshare", "baostock", "synthetic"]
     for nm in order:
-        try:
-            df = fetch_from(nm, symbol, start, end, asset)
-            if df is not None and not df.empty:
-                return df
-        except Exception:
-            continue
+        df = fetch_from(nm, symbol, start, end, asset, retries=retries, backoff=backoff)
+        if df is not None and not df.empty:
+            return df
     return None
+
+
+def last_error(name: str) -> str | None:
+    """返回某数据源最近一次失败原因（无则 None）。"""
+    return _LAST_ERRORS.get(name)
 
 
 __all__ = ["BaseSource", "SyntheticSource", "AkshareSource", "BaoStockSource",

@@ -60,7 +60,7 @@ from lianghua.indicators import INDICATOR_FUNCS
 from lianghua.ui.widgets import safe_pct, safe_num, empty_figure
 from lianghua.core.capabilities import list_capabilities, summary_counts
 from lianghua.option.strategy import (OPTION_COMBO_REGISTRY, get_option_combo, payoff_curve)
-from lianghua.data.sources import list_sources, fetch_from
+from lianghua.data.sources import list_sources, fetch_from, last_error
 from lianghua.data.universe import list_universes, get_universe
 from lianghua.execution.brokers import make_broker
 from lianghua.execution.orders import bracket_order, evaluate_bracket
@@ -788,7 +788,11 @@ def page_data_exec():
     if st.button("▶ 取数预览", key="de_fetch"):
         df = fetch_from(src, sym, "2023-01-01", "2023-06-30", asset=AssetType.STOCK)
         if df is None or df.empty:
-            st.error("该源无数据（离线或库缺失，可换 synthetic）")
+            reason = last_error(src)
+            msg = "该源无数据（离线或库缺失，可换 synthetic）"
+            if reason:
+                msg += f"｜原因：{reason}"
+            st.error(msg)
         else:
             st.dataframe(df.head(), use_container_width=True)
     st.subheader("成分 universe")
