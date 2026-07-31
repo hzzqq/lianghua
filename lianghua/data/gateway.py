@@ -78,7 +78,12 @@ class DataGateway:
             if df.empty:
                 return None
             cols = list(cols) + ["source"]
-            return df[[c for c in cols if c in df.columns]]
+            out = df[[c for c in cols if c in df.columns]]
+            # 演示(假)数据绝不应从缓存中继续提供：一旦命中 demo 缓存就当作未命中，
+            # 迫使本次 fetch 重新尝试真实源，避免"首次失败→假数据被永久缓存→用户永远看到假数据"
+            if "source" in out.columns and (out["source"] == "demo").any():
+                return None
+            return out
         except Exception:
             return None
 
@@ -460,7 +465,10 @@ class DataGateway:
         # 真实/演示统一在返回前标注来源，保证首次 fetch 也可追溯
         df = df.copy()
         df["source"] = src or "akshare"
-        self._cache_put(symbol, df, at, source=src or "akshare")
+        # 演示(假)数据不落缓存：避免假数据被永久缓存后，后续 fetch 直接命中缓存、
+        # 不再尝试真实源，导致用户永远在不知情下看到假数据。
+        if src != "demo":
+            self._cache_put(symbol, df, at, source=src or "akshare")
         return df[(df["date"] >= start) & (df["date"] <= end)].reset_index(drop=True)
 
     def _try_source(self, fn, timeout: float, retries: int, backoff: float, *args):

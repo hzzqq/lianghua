@@ -67,10 +67,13 @@ def test_gateway_source_column():
     gw = DemoGW()
     df = gw.fetch("TEST.SH", "2023-01-01", "2023-06-30", asset=AssetType.STOCK)
     assert not df.empty
+    # 返回帧仍标注 source=demo，可追溯
+    assert "source" in df.columns
+    assert str(df["source"].dropna().iloc[0]) == "demo"
+    # 演示(假)数据不应落缓存：避免被永久缓存后用户永远看到假数据而不知情
     cached = gw._cache_get("TEST.SH", "2023-01-01", "2023-06-30", AssetType.STOCK)
-    assert cached is not None and "source" in cached.columns
-    assert str(cached["source"].dropna().iloc[0]) == "demo"
-    print("✓ 网关 source 列追溯 OK（demo）")
+    assert cached is None, "演示数据不应被写入缓存"
+    print("✓ 网关 source 列追溯 OK（demo，且不落缓存）")
 
 
 # ---------------- ① UI 页面无头渲染 ----------------

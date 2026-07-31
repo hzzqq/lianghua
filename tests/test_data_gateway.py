@@ -21,7 +21,8 @@ def gw():
     if os.path.exists(db):
         try:
             os.remove(db)
-        except OSError:
+        except BaseException:
+            # 沙箱 safe-delete 拦截可能抛 SystemExit/异常，清理失败不影响测试结论
             pass
 
 
@@ -60,11 +61,19 @@ def test_fetch_minute_returns_expected_shape(gw):
 
 
 def test_list_cached_after_fetch(gw):
+    # 用真实源（mock）取数，验证 list_cached 能反映已落库的行情
+    dates = pd.bdate_range("2024-01-01", "2024-01-10")
+    real = pd.DataFrame({
+        "date": dates, "open": 100.0, "high": 101.0,
+        "low": 99.0, "close": 100.0, "volume": 1e6,
+    })
+    gw._from_akshare = lambda symbol, start, end, asset: real
     gw.fetch("600519.SH", "2024-01-01", "2024-01-10")
     cached = gw.list_cached()
     assert "600519.SH" in cached
     info = cached["600519.SH"]
     assert info["rows"] > 0
+    assert info["source"] == "akshare"
     assert info["min"] <= info["max"]
 
 
@@ -78,6 +87,13 @@ def test_with_timeout_records_error_and_returns_none(gw):
 
 
 def test_list_cached_filter_by_asset(gw):
+    # 用真实源（mock）取数，演示数据不落缓存，故须真实源才能让 list_cached 有内容
+    dates = pd.bdate_range("2024-01-01", "2024-01-10")
+    real = pd.DataFrame({
+        "date": dates, "open": 100.0, "high": 101.0,
+        "low": 99.0, "close": 100.0, "volume": 1e6,
+    })
+    gw._from_akshare = lambda symbol, start, end, asset: real
     gw.fetch("600519.SH", "2024-01-01", "2024-01-10")
     # 未拉取期权时，按 OPTION 过滤应为空
     opts = gw.list_cached(asset=AssetType.OPTION)
