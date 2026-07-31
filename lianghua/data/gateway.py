@@ -625,8 +625,12 @@ class DataGateway:
         try:
             df = self.fetch(symbol, start, end, asset=at)
             if df is not None and not df.empty:
+                # 若取数被静默降级为演示(假)数据，必须如实标注 source=demo，
+                # 绝不能冒充真实收盘价(last_close)，否则实盘引擎会用假价格做市值标记。
+                src = "demo" if str(df["source"].iloc[-1]) == "demo" else "last_close"
+                self.last_source, self.last_was_demo = src, (src == "demo")
                 return {"symbol": symbol, "price": float(df["close"].iloc[-1]),
-                        "source": "last_close"}
+                        "source": src}
         except Exception:
             pass
         return {"symbol": symbol, "price": float("nan"), "source": "none"}
