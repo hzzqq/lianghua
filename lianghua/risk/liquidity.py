@@ -23,7 +23,13 @@ def _check_triple(returns: pd.Series, volume: pd.Series, price: pd.Series) -> pd
     for name, s in (("returns", returns), ("volume", volume), ("price", price)):
         if not isinstance(s, pd.Series):
             raise TypeError(f"{name} 必须是 pandas.Series")
-    df = pd.concat([returns, volume, price], axis=1, keys=["r", "v", "p"]).astype(float)
+    # 用 inner join 显式取三者的共同观测：原先的 outer join 会先并集再靠下面的
+    # 有限性过滤把多出来的 NaN 行丢掉，结果完全相同，但 pandas 对"全 DatetimeIndex
+    # 的并集是否排序"已标记弃用（未来默认不排序 → 时间序列会变成非时序），
+    # inner join 既避开这个未来的静默行为变化，也更贴合本函数的语义。
+    df = pd.concat(
+        [returns, volume, price], axis=1, keys=["r", "v", "p"], join="inner"
+    ).astype(float)
     # 隐性修复：原对 NaN/inf 不校验，污染 |r|/成交额
     df = df[np.isfinite(df).all(axis=1)]
     if df.empty:
