@@ -213,8 +213,13 @@ print(payoff_curve(legs, 80, 120))
 - 其他：`regime`(波动率区制) / `ml_signal`(ML 信号) / `vectorized`(向量化回测对齐修复)。
 
 ### 5. 一键启动文件
-- `start.py`：`python start.py [--port 8501] [--host 0.0.0.0] [--no-browser]`
-- `run.bat` / `run.sh`：Windows / Git Bash 双击启动
+- `start.py`：`python start.py [--port 8501] [--host 127.0.0.1] [--no-browser]`
+  - 默认只监听本机；需要局域网内其它设备访问时显式加 `--host 0.0.0.0`。
+  - 会自动挑选一个真正装了 streamlit 的解释器（当前 python → 项目 venv → PATH），
+    找不到解释器或端口被占用时给出明确提示而不是报 `No module named streamlit`。
+- `run.bat` / `run.sh`：Windows / Git Bash / Linux / macOS 双击或命令行启动（转调 `start.py`，可透传参数）
+  - 可用环境变量 `LIANGHUA_PYTHON=<解释器路径>` 指定解释器。
+- `start.bat` / `start.sh` / `启动量化终端.bat`：等价别名，内部转调 `run.bat` / `run.sh`
 - `lianghua/__main__.py`：`python -m lianghua` 直接拉起终端
 
 ### 6. 更多模块接入 UI（15 页终端）
