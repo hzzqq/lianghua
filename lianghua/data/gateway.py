@@ -37,6 +37,9 @@ class DataGateway:
         self.csv_dir = Path(csv_dir) if csv_dir else None
         # 可观测性：记录最近若干次数据源失败原因，便于排障而非静默降级
         self._last_errors: list[str] = []
+        # 最近一次 fetch 的来源与是否最终落到演示（假）数据，供 UI 主动告警
+        self.last_source: str | None = None
+        self.last_was_demo: bool = False
         self._init_cache()
 
     # ---------- 缓存 ----------
@@ -394,14 +397,21 @@ class DataGateway:
     # ---------- 对外接口 ----------
     def fetch(self, symbol: str, start: str, end: str, freq: str = "daily",
               asset: AssetType | str | None = None, timeout: float = 15.0,
-              force_refresh: bool = False) -> pd.DataFrame:
+              force_refresh: bool = False, retries: int = 1, backoff: float = 0.0) -> pd.DataFrame:
         """获取行情。优先 缓存 -> CSV -> AKShare -> BaoStock -> 演示数据。
 
         对股票/基金/期货返回 OHLCV；期权返回含希腊字母的专用结构。
         四类资产均会尝试真实源（AKShare）；网络不可用/超时/接口变更时自动降级演示数据。
 
+        retries/backoff: 真实源（AKShare/BaoStock）在超时或异常时按 ``retries`` 次重试，
+            每次间隔 ``backoff`` 秒（默认不重试、间隔 0，便于单测；线上可调大以扛瞬时抖动）。
+            仅对"真实源"重试——缓存/CSV 命中与最终演示降级不重试。
         force_refresh: 为 True 时跳过缓存强制重新拉取（用于刷新/更新数据）。
         缓存仅在**完整覆盖**请求区间时才命中，避免部分缓存返回不完整数据。
+
+        降级可观测：最终落到演示（假）数据时，会在日志打 warning 并把失败原因记入
+        ``_last_errors``；调用方可读 ``last_was_demo`` / ``last_source`` 主动提示用户，
+        避免用户在不经意间拿假数据跑回测/分析。
         """
         at = AssetType(asset) if isinstance(asset, str) else (asset or detect_asset_type(symbol))
 
@@ -419,26 +429,71 @@ class DataGateway:
                 cmin, cmax = str(cached["date"].min()), str(cached["date"].max())
                 # 仅当缓存完整覆盖 [start, end] 才命中；否则回退到重新拉取补齐缺口
                 if cmin <= start and cmax >= end:
+                    self.last_source, self.last_was_demo = "cache", False
                     return cached[(cached["date"] >= start) & (cached["date"] <= end)].reset_index(drop=True)
 
         df = self._from_csv(symbol)
         src = "csv" if df is not None else None
-        # 全资产尝试 AKShare 真实源（带超时保护，避免卡死）
+        # 全资产尝试 AKShare 真实源（带超时+重试保护，避免瞬时抖动直接降级假数据）
         if df is None:
-            df = self._with_timeout(self._from_akshare, timeout, symbol, start, end, at)
+            df = self._try_source(self._from_akshare, timeout, retries, backoff,
+                                  symbol, start, end, at)
             src = "akshare" if df is not None else None
         # 股票额外尝试 BaoStock
         if df is None and at == AssetType.STOCK:
-            df = self._with_timeout(self._from_baostock, timeout, symbol, start, end)
+            df = self._try_source(self._from_baostock, timeout, retries, backoff,
+                                  symbol, start, end)
             src = "baostock" if df is not None else None
         if df is None or df.empty:
             df = self._demo_data(symbol, start, end, at)
             src = "demo"
+
+        # 降级可观测：演示（假）数据命中时明确告警，避免静默误导
+        self.last_source = src
+        self.last_was_demo = (src == "demo")
+        if src == "demo" and self._last_errors:
+            logger.warning(
+                "标 %s 真实行情获取失败，已降级为演示（假）数据；原因: %s",
+                symbol, "; ".join(self._last_errors[-3:]),
+            )
+
         # 真实/演示统一在返回前标注来源，保证首次 fetch 也可追溯
         df = df.copy()
         df["source"] = src or "akshare"
         self._cache_put(symbol, df, at, source=src or "akshare")
         return df[(df["date"] >= start) & (df["date"] <= end)].reset_index(drop=True)
+
+    def _try_source(self, fn, timeout: float, retries: int, backoff: float, *args):
+        """带超时与重试地执行真实源取数；全失败返回 None（由 fetch 降级演示数据）。
+
+        真实源可能因瞬时网络抖动/接口限流而偶发失败，重试可显著减少不必要的假数据降级。
+        每次失败原因都记入 ``_last_errors``，便于排障；``backoff`` 控制重试间隔（秒）。
+        """
+        attempts = max(1, int(retries) + 1)
+        last_exc: Exception | None = None
+        for i in range(attempts):
+            try:
+                res = self._with_timeout(fn, timeout, *args)
+                if res is not None and not (isinstance(res, pd.DataFrame) and res.empty):
+                    # 成功：清掉本次尝试前累计的瞬时失败记录，避免陈旧原因误导
+                    self._last_errors = [m for m in self._last_errors
+                                          if not m.startswith(getattr(fn, "__name__", ""))]
+                    return res
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+            if i < attempts - 1 and backoff > 0:
+                import time
+                time.sleep(backoff)
+        if last_exc is not None:
+            self._last_errors.append(
+                f"{getattr(fn, '__name__', fn)}: 重试{attempts - 1}次仍失败: {type(last_exc).__name__}: {last_exc}"
+            )
+        else:
+            # 真实源未抛异常但返回空（如依赖未安装/接口返回空），同样记录以便降级告警
+            self._last_errors.append(
+                f"{getattr(fn, '__name__', fn)}: 重试{attempts - 1}次仍无有效数据"
+            )
+        return None
 
     def _with_timeout(self, fn, timeout: float, *args):
         """在独立线程中执行网络请求，超时则返回 None（降级演示数据）。
@@ -455,6 +510,10 @@ class DataGateway:
             if len(self._last_errors) > 20:
                 self._last_errors = self._last_errors[-20:]
             return None
+
+    def last_warnings(self) -> list[str]:
+        """返回最近的数据源失败原因（用于 UI 主动提示用户假数据降级）。"""
+        return list(self._last_errors)
 
     # ---------- 分钟线（日内） ----------
     def fetch_minute(self, symbol: str, day: str, asset: str | None = None,
