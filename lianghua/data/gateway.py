@@ -196,10 +196,13 @@ class DataGateway:
 
         1) 优先真实期权日线 ``option_sse_daily_sina``（真实期权价）；
         2) 退化：真实标的 ETF 日线（``fund_etf_hist_em``）+ BS 模型期权价
-           —— 真实标的路径锚定，模型生成期权价与希腊字母；
+           —— 仅标的为真实，期权价与希腊字母均由 BS 模型合成（非真实盘口）；
+           该分支会在返回的 DataFrame.attrs 标注 ``synthetic_options=True``，
+           由 ``fetch`` 按合成(类 demo)数据处置（不落缓存、如实标注、主动告警）。
         3) 任一失败返回 None，由 ``fetch`` 降级到演示数据。
 
-        返回列对齐 ``OPTION_COLUMNS``；真实标的部分会标记 source=akshare。
+        返回列对齐 ``OPTION_COLUMNS``；分支 1（真实期权盘口）标记 source=akshare，
+        分支 2（BS 合成）标记 synthetic_options 由 fetch 降级为合成(类 demo)处置。
         """
         from ..option.pricing import bs_price, greeks
         code = symbol.split(".")[0]
@@ -266,7 +269,12 @@ class DataGateway:
                     "theta": g["theta"], "rho": g["rho"],
                     "strike": K, "expiry": expiry.strftime("%Y-%m-%d"), "type": otype,
                 })
-            return pd.DataFrame(rows)
+            # 此分支仅标的(ETF)为真实，期权价与希腊字母均由 BS 模型合成——并非真实盘口报价。
+            # 标记后由 fetch 按合成(类 demo)数据处置：不冒充 akshare、不落缓存、主动告警，
+            # 避免用户把模型合成期权价当真实盘口永久缓存并用于回测。
+            out = pd.DataFrame(rows)
+            out.attrs["synthetic_options"] = True
+            return out
         except Exception:
             return None
 
@@ -449,6 +457,15 @@ class DataGateway:
             df = self._try_source(self._from_baostock, timeout, retries, backoff,
                                   symbol, start, end)
             src = "baostock" if df is not None else None
+        # 期权盘口在真实源不可用时，可能由 BS 模型依据真实标的合成期权价/希腊字母；
+        # 这类合成期权价不是真实盘口报价，绝不能冒充 akshare（真实数据）落库、永久缓存，
+        # 否则用户做期权回测会拿到静默错误数字。按合成(类 demo)数据处置：不落缓存 + 可观测告警。
+        if (df is not None and at == AssetType.OPTION
+                and getattr(df, "attrs", {}).get("synthetic_options")):
+            src = "demo"
+            self._last_errors.append(
+                "_ak_option: 真实期权盘口不可用，期权价由 BS 模型依据真实标的合成(非真实盘口)，按合成数据处置"
+            )
         if df is None or df.empty:
             df = self._demo_data(symbol, start, end, at)
             src = "demo"

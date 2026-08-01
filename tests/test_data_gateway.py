@@ -101,3 +101,30 @@ def test_list_cached_filter_by_asset(gw):
     # 按非期权资产过滤应返回 bars 中的标的
     stocks = gw.list_cached(asset=AssetType.STOCK)
     assert "600519.SH" in stocks
+
+
+def test_option_synthetic_not_cached_as_real(gw):
+    # 真实期权盘口不可用、仅标的真实时，_ak_option 用 BS 模型合成期权价/希腊字母；
+    # 这类合成数据绝不能冒充 akshare(真实盘口) 落库/永久缓存，否则用户做期权回测会拿到
+    # 静默错误数字。应如实标 source=demo、last_was_demo=True、且不进入缓存。
+    dates = pd.bdate_range("2024-01-01", "2024-01-10")
+    synth = pd.DataFrame({
+        "date": dates,
+        "underlying": 3.0,
+        "option_price": 0.15,
+        "delta": 0.5, "gamma": 0.02, "vega": 0.05, "theta": -0.01, "rho": 0.01,
+        "strike": 3.0, "expiry": "2024-04-01", "type": "C",
+    })
+    synth.attrs["synthetic_options"] = True
+    gw._from_akshare = lambda symbol, start, end, asset: synth
+
+    df = gw.fetch("510050C3000.SH", "2024-01-01", "2024-01-10", asset=AssetType.OPTION)
+
+    # 返回数据可用，但来源必须如实标为 demo（合成），不得写 akshare
+    assert not df.empty
+    assert df["source"].iloc[0] == "demo"
+    assert gw.last_was_demo is True
+    assert gw.last_source == "demo"
+    # 合成期权价不得落缓存冒充真实数据：缓存里不应出现该期权标的
+    cached = gw.list_cached(asset=AssetType.OPTION)
+    assert "510050C3000.SH" not in cached
