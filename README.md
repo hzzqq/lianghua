@@ -69,7 +69,7 @@ python examples/run_portfolio_optimizers.py 5
 
 # 启动可视化终端（默认 http://localhost:8501，侧边栏含软件 Logo）
 streamlit run lianghua/ui/app.py
-# 或 python start.py / python -m lianghua / 双击 start.bat / 运行 start.sh
+# 或 python start.py / python -m lianghua / 双击 run.bat（中文名入口 启动量化终端.bat）/ 运行 ./run.sh
 ```
 
 ## 内置策略
@@ -219,8 +219,14 @@ print(payoff_curve(legs, 80, 120))
     找不到解释器或端口被占用时给出明确提示而不是报 `No module named streamlit`。
 - `run.bat` / `run.sh`：Windows / Git Bash / Linux / macOS 双击或命令行启动（转调 `start.py`，可透传参数）
   - 可用环境变量 `LIANGHUA_PYTHON=<解释器路径>` 指定解释器。
-- `start.bat` / `start.sh` / `启动量化终端.bat`：等价别名，内部转调 `run.bat` / `run.sh`
+- `启动量化终端.bat`：中文名双击入口，内部转调 `run.bat`（正文保持纯 ASCII —— `.bat` 里同时出现
+  `chcp 65001` 和多字节中文会让 cmd.exe 解析器按字节偏移读取时失步，把注释片段当命令执行而启动失败）
+- `start.bat` / `start.sh`：等价别名，内部转调 `run.bat` / `run.sh`（为兼容旧快捷方式与使用习惯保留）
 - `lianghua/__main__.py`：`python -m lianghua` 直接拉起终端
+
+> 换行符由 `.gitattributes` 锁定：`*.sh` 强制 LF、`*.bat` 强制 CRLF。否则在
+> `core.autocrlf=true`（Git for Windows 默认）的机器上 clone 出来的 `.sh` 会带 CRLF，
+> shebang 变成 `#!/usr/bin/env bash\r`，Git Bash / Linux 上直接报 bad interpreter。
 
 ### 6. 更多模块接入 UI（15 页终端）
 在原有 9 页基础上新增 6 页，导航共 **15 页**：
