@@ -520,21 +520,50 @@ class DataGateway:
             )
         return None
 
-    def _with_timeout(self, fn, timeout: float, *args):
-        """在独立线程中执行网络请求，超时则返回 None（降级演示数据）。
+    def _note_error(self, fn, exc: BaseException) -> None:
+        """记录一次真实源失败原因（保留最近 20 条，供 UI/排障读取）。"""
+        self._last_errors.append(
+            f"{getattr(fn, '__name__', fn)}: {type(exc).__name__}: {exc}")
+        if len(self._last_errors) > 20:
+            self._last_errors = self._last_errors[-20:]
 
-        失败时把异常原因记录到网关的 ``_last_errors``，避免静默掩盖真实错误。
+    def _with_timeout(self, fn, timeout: float, *args):
+        """在独立**守护**线程中执行网络请求，超时则返回 None（降级演示数据）。
+
+        不能用 ``with ThreadPoolExecutor(...)``：它的 ``__exit__`` 会
+        ``shutdown(wait=True)`` 去 join 工作线程，于是 ``fut.result(timeout=)``
+        抛出 TimeoutError 之后照样被卡在退出处 —— 超时保护形同虚设。
+
+        实测危害：无网环境下 baostock 的 ``rs.next()`` 会阻塞十几分钟以上，
+        ``fetch(timeout=15)`` 却一直不返回，既不降级也不报错：
+        - ``LiveEngine.step()`` 的调仓循环整体僵死，监控看不到任何 error；
+        - 全量测试从几分钟拖到一小时以上仍跑不完。
+
+        改用 daemon 线程 + ``join(timeout)``：超时后主动放弃该线程（daemon 不会
+        阻塞解释器退出），调用方在 ``timeout`` 秒内一定拿到结果或降级信号。
         """
-        try:
-            from concurrent.futures import ThreadPoolExecutor
-            with ThreadPoolExecutor(max_workers=1) as ex:
-                fut = ex.submit(fn, *args)
-                return fut.result(timeout=timeout)
-        except Exception as exc:  # noqa: BLE001 - 网络/超时异常需统一降级
-            self._last_errors.append(f"{getattr(fn, '__name__', fn)}: {type(ex).__name__}: {exc}")
-            if len(self._last_errors) > 20:
-                self._last_errors = self._last_errors[-20:]
+        import threading
+
+        box: dict = {}
+
+        def _run():
+            try:
+                box["value"] = fn(*args)
+            except BaseException as exc:  # noqa: BLE001 - 原样带回主线程记录
+                box["error"] = exc
+
+        t = threading.Thread(target=_run, daemon=True,
+                             name=f"lianghua-fetch-{getattr(fn, '__name__', 'source')}")
+        t.start()
+        t.join(max(0.0, float(timeout)))
+        if t.is_alive():
+            # 线程仍在跑：放弃等待，如实记录超时原因后降级（不 join、不阻塞调用方）
+            self._note_error(fn, TimeoutError(f"超过 {timeout}s 未返回，已放弃本次取数"))
             return None
+        if "error" in box:
+            self._note_error(fn, box["error"])
+            return None
+        return box.get("value")
 
     def last_warnings(self) -> list[str]:
         """返回最近的数据源失败原因（用于 UI 主动提示用户假数据降级）。"""
