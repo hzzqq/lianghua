@@ -47,7 +47,7 @@ def test_demo_is_not_persisted(gw):
     """真实源失败时拿到的演示数据不应被写入缓存（_cache_put 不应以 demo 落库）。"""
     put_calls = []
 
-    def fake_put(symbol, df, asset, source="unknown"):
+    def fake_put(symbol, df, asset, source="unknown", **kw):
         put_calls.append(source)
 
     gw._cache_put = fake_put
@@ -65,7 +65,7 @@ def test_real_data_still_cached(gw):
     """真实数据仍应正常缓存（行为不退化）。"""
     put_calls = []
 
-    def fake_put(symbol, df, asset, source="unknown"):
+    def fake_put(symbol, df, asset, source="unknown", **kw):
         put_calls.append(source)
 
     gw._cache_put = fake_put

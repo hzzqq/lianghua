@@ -14,6 +14,8 @@ import logging
 import os
 import sqlite3
 import threading
+from contextlib import contextmanager
+
 import numpy as np
 import pandas as pd
 from pathlib import Path
@@ -48,8 +50,23 @@ class DataGateway:
         self._init_cache()
 
     # ---------- 缓存 ----------
+    @contextmanager
+    def _connect(self):
+        """打开缓存库：提交事务并**关闭**连接。
+
+        注意 ``with sqlite3.connect(...) as con`` 只负责提交/回滚事务，并不会关闭连接。
+        直接那样写会让每一次读写都泄漏一个连接句柄：长期运行的实盘进程 fd 只增不减，
+        Windows 上还会把 data_cache.db 一直占住（删除/搬迁缓存库时报 WinError 32）。
+        """
+        con = sqlite3.connect(self.cache_db)
+        try:
+            with con:
+                yield con
+        finally:
+            con.close()
+
     def _init_cache(self):
-        with sqlite3.connect(self.cache_db) as con:
+        with self._connect() as con:
             con.execute(
                 """CREATE TABLE IF NOT EXISTS bars (
                     symbol TEXT, date TEXT, open REAL, high REAL, low REAL,
@@ -63,6 +80,15 @@ class DataGateway:
                     strike REAL, expiry TEXT, type TEXT, source TEXT,
                     PRIMARY KEY (symbol, date))"""
             )
+            # 记录每个标的"已向真实源问过、并已完整落库"的日期区间。
+            # 不能靠数据首尾日期反推覆盖范围：非交易日不会有行，
+            # 请求 2024-01-01~2024-03-31 时数据只到 2024-01-02~2024-03-29，
+            # 反推法会永远判定"未覆盖"，缓存对整月/整季度请求彻底失效。
+            con.execute(
+                """CREATE TABLE IF NOT EXISTS cache_range (
+                    symbol TEXT, tbl TEXT, start TEXT, end TEXT,
+                    PRIMARY KEY (symbol, tbl))"""
+            )
             # 老缓存库兼容：缺 source 列则补上
             for tbl in ("bars", "option_bars"):
                 try:
@@ -74,7 +100,7 @@ class DataGateway:
         try:
             table = "option_bars" if asset == AssetType.OPTION else "bars"
             cols = self.OPTION_COLUMNS if asset == AssetType.OPTION else self.COLUMNS
-            with sqlite3.connect(self.cache_db) as con:  # 上下文管理器确保连接关闭，避免句柄泄漏
+            with self._connect() as con:
                 df = pd.read_sql_query(
                     f"SELECT * FROM {table} WHERE symbol=? AND date>=? AND date<=? ORDER BY date",
                     con,
@@ -92,19 +118,48 @@ class DataGateway:
         except Exception:
             return None
 
-    def _cache_put(self, symbol: str, df: pd.DataFrame, asset: AssetType, source: str = "unknown"):
+    def _cache_put(self, symbol: str, df: pd.DataFrame, asset: AssetType, source: str = "unknown",
+                   start: str | None = None, end: str | None = None):
         try:
             df = df.copy()
             df["symbol"] = symbol
             df["source"] = source
             table = "option_bars" if asset == AssetType.OPTION else "bars"
-            with sqlite3.connect(self.cache_db) as con:
+            with self._connect() as con:
                 # 先删旧再写：保证重新拉取时缓存被刷新，
                 # 避免主键冲突导致旧/部分数据残留（覆盖完整性）。
                 con.execute(f"DELETE FROM {table} WHERE symbol=?", (symbol,))
                 df.to_sql(table, con, if_exists="append", index=False)
+                if start and end and not df.empty:
+                    # 覆盖区间 = 本次向真实源问到的窗口 ∪ 实际拿回的数据首尾。
+                    # 请求窗口本身就是"已问过"的范围，哪怕其中某些日子没有行（休市），
+                    # 也属于已知信息，不该再为此重复打网络。
+                    lo = min(start, str(df["date"].min()))
+                    hi = max(end, str(df["date"].max()))
+                    con.execute(
+                        "INSERT OR REPLACE INTO cache_range(symbol, tbl, start, end) VALUES (?,?,?,?)",
+                        (symbol, table, lo, hi),
+                    )
         except Exception:
             pass
+
+    def _cache_covers(self, symbol: str, asset: AssetType, start: str, end: str,
+                      cached: pd.DataFrame) -> bool:
+        """判断本地缓存是否已完整覆盖 [start, end]。"""
+        table = "option_bars" if asset == AssetType.OPTION else "bars"
+        try:
+            with self._connect() as con:
+                row = con.execute(
+                    "SELECT start, end FROM cache_range WHERE symbol=? AND tbl=?",
+                    (symbol, table),
+                ).fetchone()
+        except Exception:
+            row = None
+        if row and row[0] and row[1]:
+            return str(row[0]) <= start and str(row[1]) >= end
+        # 老缓存库没有覆盖区间记录：退回按数据首尾日期判断。
+        # 这条路偏保守（非交易日边界会误判未覆盖而重新拉取），但不会返回缺口数据。
+        return str(cached["date"].min()) <= start and str(cached["date"].max()) >= end
 
     # ---------- 数据源：CSV ----------
     def _from_csv(self, symbol: str) -> pd.DataFrame | None:
@@ -444,9 +499,8 @@ class DataGateway:
         if not force_refresh:
             cached = self._cache_get(symbol, start, end, at)
             if cached is not None and not cached.empty:
-                cmin, cmax = str(cached["date"].min()), str(cached["date"].max())
                 # 仅当缓存完整覆盖 [start, end] 才命中；否则回退到重新拉取补齐缺口
-                if cmin <= start and cmax >= end:
+                if self._cache_covers(symbol, at, start, end, cached):
                     self.last_source, self.last_was_demo = "cache", False
                     return cached[(cached["date"] >= start) & (cached["date"] <= end)].reset_index(drop=True)
 
@@ -490,7 +544,7 @@ class DataGateway:
         # 演示(假)数据不落缓存：避免假数据被永久缓存后，后续 fetch 直接命中缓存、
         # 不再尝试真实源，导致用户永远在不知情下看到假数据。
         if src != "demo":
-            self._cache_put(symbol, df, at, source=src or "akshare")
+            self._cache_put(symbol, df, at, source=src or "akshare", start=start, end=end)
         return df[(df["date"] >= start) & (df["date"] <= end)].reset_index(drop=True)
 
     def _try_source(self, fn, timeout: float, retries: int, backoff: float, *args):
@@ -659,7 +713,7 @@ class DataGateway:
 
     def _query_all(self, sql: str):
         try:
-            with sqlite3.connect(self.cache_db) as con:
+            with self._connect() as con:
                 cur = con.execute(sql)
                 return cur.fetchall()
         except Exception as exc:  # noqa: BLE001
@@ -668,7 +722,7 @@ class DataGateway:
 
     def _count(self, table: str, symbol: str) -> int:
         try:
-            with sqlite3.connect(self.cache_db) as con:
+            with self._connect() as con:
                 return con.execute(
                     f"SELECT COUNT(*) FROM {table} WHERE symbol=?", (symbol,)
                 ).fetchone()[0]
