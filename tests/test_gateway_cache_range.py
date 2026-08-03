@@ -159,6 +159,34 @@ def test_disjoint_ranges_do_not_claim_to_cover_the_gap(cache_db):
     assert len(out) == len(_bars("2024-01-01", "2024-06-30"))
 
 
+def test_today_is_never_treated_as_settled(cache_db):
+    """当天行情盘中还在变，不能被算进"已覆盖"区间。
+
+    否则盘中取一次 [start, 今天]（此时源里还没有当天K线），收盘后再取会一直命中
+    缓存，用户/实盘引擎永远看不到当天行情，只能拿昨天的价格做决策。
+    """
+    today = pd.Timestamp.today().normalize()
+    start = (today - pd.Timedelta(days=60)).strftime("%Y-%m-%d")
+    end = today.strftime("%Y-%m-%d")
+    yday = (today - pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+
+    gw = DataGateway(cache_db=cache_db)
+    gw._from_akshare = lambda s, a, b, asset=None: _bars(start, yday)
+    intraday = gw.fetch("600000.SH", start, end, asset=AssetType.STOCK)
+    assert str(intraday["date"].max()) <= yday
+
+    gw._from_akshare = lambda s, a, b, asset=None: _bars(start, end)
+    after_close = gw.fetch("600000.SH", start, end, asset=AssetType.STOCK)
+    assert gw.last_source != "cache", "请求区间含当天时不应命中缓存"
+    assert str(after_close["date"].max()) >= yday
+
+    # 但纯历史区间仍应正常命中缓存，别把优化整个废掉
+    hist_end = (today - pd.Timedelta(days=10)).strftime("%Y-%m-%d")
+    gw._from_akshare = lambda *a, **k: pytest.fail("纯历史区间应命中缓存")
+    gw.fetch("600000.SH", start, hist_end, asset=AssetType.STOCK)
+    assert gw.last_source == "cache"
+
+
 def test_legacy_cache_without_range_table_still_usable(cache_db):
     """老缓存库没有 cache_range 表：退回按数据首尾判断，仍能命中，不能直接报错。"""
     con = sqlite3.connect(cache_db)

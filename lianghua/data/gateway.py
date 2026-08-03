@@ -132,6 +132,13 @@ class DataGateway:
             if start and end and not df.empty:
                 lo = min(start, str(df["date"].min()))
                 hi = max(end, str(df["date"].max()))
+                # 尚未收盘/尚未产生的日期不能算"已问过"：盘中取一次
+                # [start, 今天] 后，源里还没有今天的K线，若把覆盖区间记到今天，
+                # 收盘后再取会一直命中缓存、永远看不到当天行情（实盘会用昨天的价格做决策）。
+                # 历史区间不会再变，可以放心声称覆盖。
+                hi = min(hi, self._last_settled_date())
+                if hi < lo:  # 只问了今天：当天数据始终重新拉取，不进覆盖区间
+                    lo = hi = None
             with self._connect() as con:
                 old = None
                 if lo:
@@ -160,6 +167,15 @@ class DataGateway:
                     )
         except Exception:
             pass
+
+    @staticmethod
+    def _last_settled_date() -> str:
+        """最后一个"数据不会再变"的自然日 = 昨天。
+
+        今天的行情盘中随时在变、收盘后才定稿，把今天算进缓存覆盖区间
+        会让当天的后续请求全部命中陈旧缓存。
+        """
+        return (pd.Timestamp.today().normalize() - pd.Timedelta(days=1)).strftime("%Y-%m-%d")
 
     @staticmethod
     def _ranges_join(a_start: str, a_end: str, b_start: str, b_end: str) -> bool:
