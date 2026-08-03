@@ -187,6 +187,40 @@ def test_today_is_never_treated_as_settled(cache_db):
     assert gw.last_source == "cache"
 
 
+def test_cache_keeps_refreshing_when_range_includes_today(cache_db):
+    """请求区间含当天时，缓存必须持续刷新。
+
+    当天不进覆盖区间、但当天的行仍要落库。若删除范围只按覆盖区间算，
+    当天那一行漏删 → 撞主键 → 整次写入回滚 → 缓存从此再也刷不新，
+    而异常被吞掉后完全不可见。
+    """
+    today = pd.Timestamp.today().normalize()
+    start = (today - pd.Timedelta(days=60)).strftime("%Y-%m-%d")
+    end = today.strftime("%Y-%m-%d")
+
+    def _priced(close):
+        df = _bars(start, end)
+        df["close"] = close
+        return df
+
+    gw = DataGateway(cache_db=cache_db)
+    gw._from_akshare = lambda *a, **k: _priced(10.0)
+    gw.fetch("600000.SH", start, end, asset=AssetType.STOCK)
+
+    gw._from_akshare = lambda *a, **k: _priced(20.0)
+    gw.fetch("600000.SH", start, end, asset=AssetType.STOCK)
+
+    con = sqlite3.connect(cache_db)
+    closes = {r[0] for r in con.execute(
+        "SELECT DISTINCT close FROM bars WHERE symbol=?", ("600000.SH",))}
+    rows, uniq = con.execute(
+        "SELECT COUNT(*), COUNT(DISTINCT date) FROM bars WHERE symbol=?",
+        ("600000.SH",)).fetchone()
+    con.close()
+    assert closes == {20.0}, f"缓存未被刷新，仍是旧价: {closes}"
+    assert rows == uniq, "落库出现重复日期"
+
+
 def test_legacy_cache_without_range_table_still_usable(cache_db):
     """老缓存库没有 cache_range 表：退回按数据首尾判断，仍能命中，不能直接报错。"""
     con = sqlite3.connect(cache_db)

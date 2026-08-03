@@ -128,16 +128,17 @@ class DataGateway:
             # 本次覆盖区间 = 向真实源问到的窗口 ∪ 实际拿回的数据首尾。
             # 请求窗口本身就是"已问过"的范围，哪怕其中某些日子没有行（休市），
             # 也属于已知信息，不该再为此重复打网络。
+            data_lo = str(df["date"].min()) if not df.empty else None
+            data_hi = str(df["date"].max()) if not df.empty else None
             lo = hi = None
-            if start and end and not df.empty:
-                lo = min(start, str(df["date"].min()))
-                hi = max(end, str(df["date"].max()))
+            if start and end and data_lo:
+                lo = min(start, data_lo)
                 # 尚未收盘/尚未产生的日期不能算"已问过"：盘中取一次
                 # [start, 今天] 后，源里还没有今天的K线，若把覆盖区间记到今天，
                 # 收盘后再取会一直命中缓存、永远看不到当天行情（实盘会用昨天的价格做决策）。
                 # 历史区间不会再变，可以放心声称覆盖。
-                hi = min(hi, self._last_settled_date())
-                if hi < lo:  # 只问了今天：当天数据始终重新拉取，不进覆盖区间
+                hi = min(max(end, data_hi), self._last_settled_date())
+                if hi < lo:  # 只问了当天：当天数据始终重新拉取，不进覆盖区间
                     lo = hi = None
             with self._connect() as con:
                 old = None
@@ -150,9 +151,13 @@ class DataGateway:
                     # 新旧窗口相交或首尾相邻：只覆盖重叠的那段，旧区间的数据继续保留。
                     # 否则用户在 UI 上来回切时间区间（Q1→Q2→回看 Q1）会把上一段缓存
                     # 整块删掉，每切一次都重新打网络。
+                    #
+                    # 删除范围必须覆盖本次要写入的全部行（data_lo~data_hi），而不只是
+                    # 可声称的覆盖区间：当天数据不进覆盖区间，但它确实要落库，
+                    # 漏删就会撞主键、让整次写入回滚，缓存从此再也刷不新。
                     con.execute(
                         f"DELETE FROM {table} WHERE symbol=? AND date>=? AND date<=?",
-                        (symbol, lo, hi),
+                        (symbol, min(lo, data_lo), max(hi, data_hi)),
                     )
                     lo, hi = min(lo, str(old[0])), max(hi, str(old[1]))
                 else:
@@ -165,8 +170,10 @@ class DataGateway:
                         "INSERT OR REPLACE INTO cache_range(symbol, tbl, start, end) VALUES (?,?,?,?)",
                         (symbol, table, lo, hi),
                     )
-        except Exception:
-            pass
+        except Exception as exc:  # noqa: BLE001
+            # 缓存写失败不该中断取数，但必须留痕：静默吞掉会让"缓存永远刷不新"
+            # 这类问题彻底不可见（本次即由此暴露）。
+            logger.warning("行情缓存写入失败 %s/%s: %s", symbol, asset, exc)
 
     @staticmethod
     def _last_settled_date() -> str:
