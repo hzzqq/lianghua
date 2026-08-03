@@ -125,23 +125,56 @@ class DataGateway:
             df["symbol"] = symbol
             df["source"] = source
             table = "option_bars" if asset == AssetType.OPTION else "bars"
+            # 本次覆盖区间 = 向真实源问到的窗口 ∪ 实际拿回的数据首尾。
+            # 请求窗口本身就是"已问过"的范围，哪怕其中某些日子没有行（休市），
+            # 也属于已知信息，不该再为此重复打网络。
+            lo = hi = None
+            if start and end and not df.empty:
+                lo = min(start, str(df["date"].min()))
+                hi = max(end, str(df["date"].max()))
             with self._connect() as con:
-                # 先删旧再写：保证重新拉取时缓存被刷新，
-                # 避免主键冲突导致旧/部分数据残留（覆盖完整性）。
-                con.execute(f"DELETE FROM {table} WHERE symbol=?", (symbol,))
+                old = None
+                if lo:
+                    old = con.execute(
+                        "SELECT start, end FROM cache_range WHERE symbol=? AND tbl=?",
+                        (symbol, table),
+                    ).fetchone()
+                if lo and old and old[0] and old[1] and self._ranges_join(old[0], old[1], lo, hi):
+                    # 新旧窗口相交或首尾相邻：只覆盖重叠的那段，旧区间的数据继续保留。
+                    # 否则用户在 UI 上来回切时间区间（Q1→Q2→回看 Q1）会把上一段缓存
+                    # 整块删掉，每切一次都重新打网络。
+                    con.execute(
+                        f"DELETE FROM {table} WHERE symbol=? AND date>=? AND date<=?",
+                        (symbol, lo, hi),
+                    )
+                    lo, hi = min(lo, str(old[0])), max(hi, str(old[1]))
+                else:
+                    # 与已有区间之间存在缺口（或本次没有区间信息）：整块替换。
+                    # 保留缺口数据会让 cache_range 谎称覆盖了从未拉取过的日期。
+                    con.execute(f"DELETE FROM {table} WHERE symbol=?", (symbol,))
                 df.to_sql(table, con, if_exists="append", index=False)
-                if start and end and not df.empty:
-                    # 覆盖区间 = 本次向真实源问到的窗口 ∪ 实际拿回的数据首尾。
-                    # 请求窗口本身就是"已问过"的范围，哪怕其中某些日子没有行（休市），
-                    # 也属于已知信息，不该再为此重复打网络。
-                    lo = min(start, str(df["date"].min()))
-                    hi = max(end, str(df["date"].max()))
+                if lo:
                     con.execute(
                         "INSERT OR REPLACE INTO cache_range(symbol, tbl, start, end) VALUES (?,?,?,?)",
                         (symbol, table, lo, hi),
                     )
         except Exception:
             pass
+
+    @staticmethod
+    def _ranges_join(a_start: str, a_end: str, b_start: str, b_end: str) -> bool:
+        """两个日期区间相交或首尾相邻（合并后中间没有缺口）时为 True。
+
+        相邻按自然日判断：[01-01, 03-31] 与 [04-01, 06-30] 合并后是连续的
+        [01-01, 06-30]，中间没有任何未拉取过的日期，可以安全合并。
+        """
+        try:
+            one = pd.Timedelta(days=1)
+            a0, a1 = pd.Timestamp(a_start), pd.Timestamp(a_end)
+            b0, b1 = pd.Timestamp(b_start), pd.Timestamp(b_end)
+        except Exception:  # noqa: BLE001
+            return False
+        return a0 <= b1 + one and b0 <= a1 + one
 
     def _cache_covers(self, symbol: str, asset: AssetType, start: str, end: str,
                       cached: pd.DataFrame) -> bool:

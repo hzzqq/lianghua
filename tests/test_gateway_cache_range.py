@@ -112,6 +112,53 @@ def test_repeated_fetch_does_not_leak_sqlite_handles(cache_db):
     open(cache_db, "wb").close()  # 交还给 fixture 清理
 
 
+def test_adjacent_ranges_are_merged_instead_of_wiping_each_other(cache_db):
+    """在 UI 上来回切时间区间不该把上一段缓存整块删掉。
+
+    取 Q1 → 取 Q2 → 回看 Q1，第三次必须命中缓存；
+    并且合并后的 Q1+Q2 应能直接满足"跨两个季度"的请求。
+    """
+    calls: list = []
+    gw = DataGateway(cache_db=cache_db)
+
+    def _src(symbol, start, end, asset=None):
+        calls.append((start, end))
+        return _bars(start, end)
+
+    gw._from_akshare = _src
+
+    gw.fetch("600000.SH", "2024-01-01", "2024-03-31", asset=AssetType.STOCK)
+    gw.fetch("600000.SH", "2024-04-01", "2024-06-30", asset=AssetType.STOCK)
+
+    gw.fetch("600000.SH", "2024-01-01", "2024-03-31", asset=AssetType.STOCK)
+    assert gw.last_source == "cache", f"回看 Q1 应命中缓存，实际重新拉取: {calls}"
+
+    both = gw.fetch("600000.SH", "2024-01-01", "2024-06-30", asset=AssetType.STOCK)
+    assert gw.last_source == "cache", "相邻区间合并后应能覆盖跨季度请求"
+    assert len(both) == len(_bars("2024-01-01", "2024-06-30")), "合并后数据不应有缺口"
+    assert len(calls) == 2, f"真实源只应被调用两次，实际: {calls}"
+
+
+def test_disjoint_ranges_do_not_claim_to_cover_the_gap(cache_db):
+    """两段区间之间有缺口时，绝不能谎称已覆盖整段——那会把缺口数据静默吞掉。"""
+    gw = DataGateway(cache_db=cache_db)
+    gw._from_akshare = lambda symbol, start, end, asset=None: _bars(start, end)
+
+    gw.fetch("600000.SH", "2024-01-01", "2024-01-31", asset=AssetType.STOCK)
+    gw.fetch("600000.SH", "2024-06-01", "2024-06-30", asset=AssetType.STOCK)
+
+    pulled: list = []
+
+    def _src(symbol, start, end, asset=None):
+        pulled.append((start, end))
+        return _bars(start, end)
+
+    gw._from_akshare = _src
+    out = gw.fetch("600000.SH", "2024-01-01", "2024-06-30", asset=AssetType.STOCK)
+    assert pulled, "中间 2~5 月从未拉取过，不能直接命中缓存"
+    assert len(out) == len(_bars("2024-01-01", "2024-06-30"))
+
+
 def test_legacy_cache_without_range_table_still_usable(cache_db):
     """老缓存库没有 cache_range 表：退回按数据首尾判断，仍能命中，不能直接报错。"""
     con = sqlite3.connect(cache_db)
