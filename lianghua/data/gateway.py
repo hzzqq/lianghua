@@ -13,6 +13,7 @@ from __future__ import annotations
 import logging
 import os
 import sqlite3
+import threading
 import numpy as np
 import pandas as pd
 from pathlib import Path
@@ -40,6 +41,10 @@ class DataGateway:
         # 最近一次 fetch 的来源与是否最终落到演示（假）数据，供 UI 主动告警
         self.last_source: str | None = None
         self.last_was_demo: bool = False
+        # 因超时被放弃、但仍在后台真实跑着的取数线程（按数据源名分组）。
+        # 用于阻止对已卡死的源继续放大请求，详见 _with_timeout / _abandoned_alive。
+        self._abandoned: dict[str, list[threading.Thread]] = {}
+        self._abandoned_lock = threading.Lock()
         self._init_cache()
 
     # ---------- 缓存 ----------
@@ -541,8 +546,20 @@ class DataGateway:
 
         改用 daemon 线程 + ``join(timeout)``：超时后主动放弃该线程（daemon 不会
         阻塞解释器退出），调用方在 ``timeout`` 秒内一定拿到结果或降级信号。
+
+        放弃线程留下的后果必须自己兜住：被放弃的线程仍在真实地占着一条连接跑。
+        若不管它，同一个卡死的源会被反复重新请求（``_try_source`` 的重试、
+        ``LiveEngine`` 每轮轮询），于是请求被放大、守护线程与 socket 无上限堆积。
+        因此这里加一道**在途守卫**：某个源上一次被放弃的线程只要还活着，就直接
+        快速失败降级，不再对它发起新请求。守卫是自愈的——那条线程一旦真的返回，
+        该源立刻恢复可用，不依赖任何超时冷却常量。
         """
-        import threading
+        name = getattr(fn, "__name__", str(fn))
+        if self._abandoned_alive(name):
+            self._note_error(fn, TimeoutError(
+                "上一次取数超时后仍未返回，本次直接降级；"
+                "避免对已卡死的源放大请求并堆积线程"))
+            return None
 
         box: dict = {}
 
@@ -553,17 +570,33 @@ class DataGateway:
                 box["error"] = exc
 
         t = threading.Thread(target=_run, daemon=True,
-                             name=f"lianghua-fetch-{getattr(fn, '__name__', 'source')}")
+                             name=f"lianghua-fetch-{name}")
         t.start()
         t.join(max(0.0, float(timeout)))
         if t.is_alive():
-            # 线程仍在跑：放弃等待，如实记录超时原因后降级（不 join、不阻塞调用方）
+            # 线程仍在跑：放弃等待，登记为在途后如实记录超时原因（不 join、不阻塞调用方）
+            with self._abandoned_lock:
+                self._abandoned.setdefault(name, []).append(t)
             self._note_error(fn, TimeoutError(f"超过 {timeout}s 未返回，已放弃本次取数"))
             return None
         if "error" in box:
             self._note_error(fn, box["error"])
             return None
         return box.get("value")
+
+    def _abandoned_alive(self, name: str) -> int:
+        """回收已结束的被放弃线程，返回该源仍在途的被放弃线程数。
+
+        只统计**因超时被放弃**的线程：正常完成的请求线程会自然退出并在此被清掉，
+        所以并发地对同一个健康源取数不会被本守卫误伤。
+        """
+        with self._abandoned_lock:
+            alive = [t for t in self._abandoned.get(name, ()) if t.is_alive()]
+            if alive:
+                self._abandoned[name] = alive
+            else:
+                self._abandoned.pop(name, None)
+            return len(alive)
 
     def last_warnings(self) -> list[str]:
         """返回最近的数据源失败原因（用于 UI 主动提示用户假数据降级）。"""

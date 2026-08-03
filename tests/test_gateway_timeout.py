@@ -109,3 +109,89 @@ def test_timeout_does_not_break_fast_source(gw):
     assert not gw.last_was_demo
     assert gw.last_source == "akshare"
     assert len(df) > 0
+
+
+def test_timeout_is_not_retried_into_a_request_storm(gw):
+    """卡死的源不得被重试放大：一次 fetch 里每个源最多只发一次真实请求。
+
+    放弃线程后那条请求仍占着连接在跑，立刻重试等于对同一个已证明卡死的端点
+    再压一条连接；``retries`` 是为"快速失败的瞬时抖动"准备的，不是为超时准备的。
+    """
+    release = threading.Event()
+    calls: list[str] = []
+
+    def ak_source(symbol, start, end, asset=None):
+        calls.append("ak")
+        release.wait(120)
+        return _ohlc()
+
+    def bs_source(symbol, start, end, asset=None):
+        calls.append("bs")
+        release.wait(120)
+        return _ohlc()
+
+    gw._from_akshare = ak_source
+    gw._from_baostock = bs_source
+    try:
+        gw.fetch("600000.SH", "2024-01-01", "2024-01-10", asset="stock",
+                 timeout=0.3, retries=3, backoff=0)
+    finally:
+        release.set()
+
+    # akshare 1 次 + baostock 1 次；retries=3 不得把它放大成 (3+1)*2=8 次。
+    # 只断言请求次数：它是确定性的，不像墙钟耗时那样在满载的全量测试里飘。
+    assert calls == ["ak", "bs"], f"卡死源被重试放大为 {calls}"
+    assert gw.last_was_demo
+
+
+def test_hung_source_is_skipped_until_it_actually_returns(gw):
+    """跨 fetch 的在途守卫：源还卡着就直接降级，它一返回就立刻恢复可用。
+
+    没有这道守卫时，LiveEngine 每轮轮询都会对同一个卡死的源新起一条守护线程，
+    线程与 socket 无上限堆积；实测 test_paper_end_to_end（2 标的 x 2 步）
+    因此空等 230s。
+    """
+    release = threading.Event()
+    calls: list[str] = []
+
+    def ak_source(symbol, start, end, asset=None):
+        calls.append("ak")
+        release.wait(120)
+        return _ohlc()
+
+    def bs_source(symbol, start, end, asset=None):
+        calls.append("bs")
+        release.wait(120)
+        return _ohlc()
+
+    gw._from_akshare = ak_source
+    gw._from_baostock = bs_source
+    try:
+        gw.fetch("600000.SH", "2024-01-01", "2024-01-10", asset="stock",
+                 timeout=0.3, retries=0, backoff=0)
+        assert calls == ["ak", "bs"]
+
+        # 第二次 fetch：两个源都还卡着 -> 一次新请求都不该发，且要立即降级。
+        # 故意把 timeout 放大到 5s：守卫生效则几乎零耗时，失效则要等满两个 5s，
+        # 于是 2s 的判据有足够余量，不会在满载的全量测试里误报。
+        t0 = time.monotonic()
+        gw.fetch("600000.SH", "2024-01-01", "2024-01-10", asset="stock",
+                 timeout=5, retries=0, backoff=0, force_refresh=True)
+        assert calls == ["ak", "bs"], "卡死期间不应再对该源发起新请求"
+        assert time.monotonic() - t0 < 2, "在途守卫应当立即降级而不是再等一个 timeout"
+        assert gw.last_was_demo
+        assert any("仍未返回" in w for w in gw.last_warnings())
+    finally:
+        release.set()
+
+    # 卡死的线程真的返回后，守卫自愈：同一个源重新可用（不依赖任何冷却常量）
+    for _ in range(300):
+        if not gw._abandoned_alive("ak_source"):
+            break
+        time.sleep(0.02)
+    df = gw.fetch("600000.SH", "2024-01-01", "2024-01-10", asset="stock",
+                  timeout=5, retries=0, backoff=0, force_refresh=True)
+    assert calls.count("ak") == 2, "线程返回后该源应被重新调用"
+    assert not gw.last_was_demo, "卡死线程返回后该源应恢复可用（守卫需自愈）"
+    assert gw.last_source == "akshare"
+    assert len(df) > 0
