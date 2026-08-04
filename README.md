@@ -221,7 +221,6 @@ print(payoff_curve(legs, 80, 120))
   - 可用环境变量 `LIANGHUA_PYTHON=<解释器路径>` 指定解释器。
 - `启动量化终端.bat`：中文名双击入口，内部转调 `run.bat`（正文保持纯 ASCII —— `.bat` 里同时出现
   `chcp 65001` 和多字节中文会让 cmd.exe 解析器按字节偏移读取时失步，把注释片段当命令执行而启动失败）
-- `start.bat` / `start.sh`：等价别名，内部转调 `run.bat` / `run.sh`（为兼容旧快捷方式与使用习惯保留）
 - `lianghua/__main__.py`：`python -m lianghua` 直接拉起终端
 
 > 换行符由 `.gitattributes` 锁定：`*.sh` 强制 LF、`*.bat` 强制 CRLF。否则在

@@ -22,10 +22,10 @@ import time
 import pytest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-# 所有对外承诺的启动入口都必须逐一体检：run.* 是主入口，中文名 .bat 是双击入口，
-# start.* 是为兼容旧使用习惯（快捷方式、文档、肌肉记忆）保留的转调别名。
-BAT_FILES = ["run.bat", "start.bat", "启动量化终端.bat"]
-SH_FILES = ["run.sh", "start.sh"]
+# 所有对外承诺的启动入口都必须逐一体检：start.py 是核心入口（自动探测 streamlit 解释器），
+# run.bat / run.sh 是 Windows / Unix 主入口，启动量化终端.bat 是中文名双击入口。
+BAT_FILES = ["run.bat", "启动量化终端.bat"]
+SH_FILES = ["run.sh"]
 BOM = b"\xef\xbb\xbf"
 
 
