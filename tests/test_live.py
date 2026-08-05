@@ -217,12 +217,42 @@ def test_pt_with_stub():
 
 
 # ---------- 7. live_quote 降级 ----------
-def test_live_quote():
+def _offline_akshare(monkeypatch):
+    """把 AKShare 实时快照接口钉成不可用，强制 live_quote 走断网降级分支。"""
+    import types as _types
+
+    def _down(*_a, **_k):
+        raise RuntimeError("offline: 实时行情接口在测试中被禁用")
+
+    ak = sys.modules.get("akshare")
+    if ak is None:
+        ak = _types.ModuleType("akshare")
+        monkeypatch.setitem(sys.modules, "akshare", ak)
+    monkeypatch.setattr(ak, "stock_zh_a_spot_em", _down, raising=False)
+    monkeypatch.setattr(ak, "fund_etf_spot_em", _down, raising=False)
+
+
+def test_live_quote(monkeypatch):
+    """断网时 live_quote 必须靠日线/演示数据兜底给出可用正价。
+
+    本用例考的就是"断网降级"，所以必须**真的断网**：早先它直接 ``DataGateway()``
+    去打 AKShare 实时接口，于是在有外网的机器上根本走不到被测的降级分支，还独吞
+    125 秒（占全套件耗时的三分之二），并把真实行情写进仓库根目录的 data_cache.db。
+    这里把实时接口钉成不可用、缓存放内存：断言更强，耗时归零。
+    """
     from lianghua.data.gateway import DataGateway
-    q = DataGateway().live_quote("600519.SH")
+
+    _offline_akshare(monkeypatch)
+    gw = DataGateway(cache_db=":memory:")
+    gw.fetch = lambda *a, **k: pd.DataFrame({
+        "date": ["2024-01-02"], "open": [100.0], "high": [101.0],
+        "low": [99.0], "close": [100.5], "volume": [1e6], "source": ["demo"],
+    })
+    q = gw.live_quote("600519.SH")
     assert q["symbol"] == "600519.SH" and q["price"] > 0
-    assert "source" in q
-    ok("live_quote 实时/降级快照 price>0（source=%s）" % q["source"])
+    # 降级到演示(假)数据时必须如实标注，不得冒充真实收盘价
+    assert q["source"] == "demo" and gw.last_was_demo is True
+    ok("live_quote 断网降级 price>0 且如实标 source=demo")
 
 
 if __name__ == "__main__":
@@ -235,5 +265,7 @@ if __name__ == "__main__":
     test_live_guard()
     test_qmt_pt_graceful()
     test_pt_with_stub()
-    test_live_quote()
+    import pytest as _pytest
+    with _pytest.MonkeyPatch.context() as _mp:
+        test_live_quote(_mp)
     print("\n全部 %d 项实盘测试通过 ✅" % len(PASS))
