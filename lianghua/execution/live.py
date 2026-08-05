@@ -24,6 +24,25 @@ def _asset_val(at):
     return at.value if hasattr(at, "value") else at
 
 
+def _usable_price(value) -> float | None:
+    """把报价规整成"可用于交易决策的价格"，否则返回 None。
+
+    取数彻底失败时 gateway.live_quote 返回 ``price=NaN``，而 NaN 会安静地穿过所有
+    朴素校验：``NaN or 0.0`` 得到的还是 NaN（NaN 为真值）、``NaN <= 0`` 为 False。
+    于是 NaN 会一路流进
+      - 市值 ``qty * NaN`` -> 整个账户权益变成 NaN；
+      - 止损/止盈比较（全部为 False）-> **持仓永远不会被止损**，且没有任何报错。
+    这里统一收口：只有有限的正数才算有效报价。
+    """
+    try:
+        px = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(px) or px <= 0:
+        return None
+    return px
+
+
 def _resolve_strategy(name_or_fn):
     """字符串 -> registry 策略实例；策略对象/可调用对象直接返回。"""
     if not isinstance(name_or_fn, str) and (
@@ -64,6 +83,8 @@ class LiveEngine:
         self.tp_pct = tp_pct          # 止盈比例
         self.trailing_pct = trailing_pct  # 移动止盈（从峰值回撤比例）
         self._peak: dict[str, float] = {}
+        # 本轮实时报价的降级原因（symbol -> 原因），由 step 汇总进 status["errors"]
+        self._quote_notes: dict[str, str] = {}
         self._last_acct: dict = {}
         self.killed = False
         self.last_status: dict | None = None
@@ -85,6 +106,20 @@ class LiveEngine:
             return a if isinstance(a, AssetType) else AssetType(a)
         return detect_asset_type(sym)
 
+    def _mark_to_market(self, quotes: dict) -> dict:
+        """按现有报价折算各持仓市值；报价不可用时退回成本价（绝不产出 NaN）。
+
+        NaN 市值会让 ``get_account`` 算出的整个账户权益变成 NaN——一个数字都不能看，
+        而且看不出是哪一只标的出的问题。宁可标在成本价（并由 step 把这件事写进
+        ``errors``），也不要让一条坏报价污染全账户。
+        """
+        mv = {}
+        for s, p in (getattr(self.broker, "positions", {}) or {}).items():
+            px = (_usable_price(quotes.get(s))
+                  or _usable_price(getattr(p, "avg_price", None)) or 0.0)
+            mv[s] = abs(getattr(p, "qty", 0)) * px
+        return mv
+
     def _recent(self, sym: str):
         at = self._asset(sym)
         if self.realtime:
@@ -104,13 +139,19 @@ class LiveEngine:
         last = int(np.sign(float(sig.iloc[-1]))) if len(sig) else 0
         last_close = float(df["close"].iloc[-1]) if len(df) else 0.0
         if self.realtime:
+            # 实时价拿不到就沿用分钟线最后收盘：这是有意的降级，但不能连原因都吞掉。
             try:
-                q = self.gateway.live_quote(sym, asset=_asset_val(at))
-                p = float(q.get("price", 0.0) or 0.0)
-                if p > 0:
-                    last_close = p
-            except Exception:
-                pass
+                p = _usable_price(
+                    self.gateway.live_quote(sym, asset=_asset_val(at)).get("price"))
+            except Exception as e:  # noqa: BLE001
+                p = None
+                self._quote_notes[sym] = "实时快照异常: %s" % e
+            else:
+                if p is None:
+                    self._quote_notes[sym] = "实时快照无有效价，回退分钟线收盘"
+            if p is not None:
+                last_close = p
+                self._quote_notes.pop(sym, None)
         return last, at, last_close, df
 
     # ---------- 仓位 ----------
@@ -139,14 +180,19 @@ class LiveEngine:
             if qty == 0:
                 continue
             at = getattr(pos, "asset_type", self._asset(sym))
-            px = quotes.get(sym)
-            if px in (None, 0.0):
+            px = _usable_price(quotes.get(sym))
+            if px is None:
                 try:
-                    px = float(self.gateway.live_quote(
-                        sym, _asset_val(at)).get("price") or 0.0)
-                except Exception:
+                    px = _usable_price(
+                        self.gateway.live_quote(sym, _asset_val(at)).get("price"))
+                except Exception as e:  # noqa: BLE001
+                    actions.append({"symbol": sym, "action": "exit_skip",
+                                    "reason": "报价不可用，本轮退出检查已跳过: %s" % e})
                     continue
-            if px is None or px <= 0:
+            if px is None:
+                # 报价缺失/NaN 时绝不能"静默跳过"：调用方会以为止损仍在生效。
+                actions.append({"symbol": sym, "action": "exit_skip",
+                                "reason": "报价不可用，本轮止损/止盈未执行"})
                 continue
             avg = float(getattr(pos, "avg_price", px) or px)
             if self.trailing_pct:
@@ -214,6 +260,7 @@ class LiveEngine:
         actions: list[dict] = []
         quotes: dict[str, float] = {}
         signals: dict[str, tuple] = {}
+        self._quote_notes.clear()
         try:
             self.broker.connect()
         except Exception as e:
@@ -226,18 +273,26 @@ class LiveEngine:
             except Exception as e:  # 单标的失败不拖垮整体
                 actions.append({"symbol": sym, "action": "skip",
                                 "reason": "数据/信号失败: %s" % e})
+        # 盘中模式用实时价决策，实时价拿不到而回落到收盘价必须让调用方看见
+        errors.extend("标的 %s 决策价已回退（%s）" % (s, why)
+                      for s, why in sorted(self._quote_notes.items()))
         # 补全持仓标的的实时价（退出检查需要）
         for s in (getattr(self.broker, "positions", {}) or {}):
-            if s not in quotes:
-                try:
-                    qq = self.gateway.live_quote(s, _asset_val(self._asset(s)))
-                    quotes[s] = float(qq.get("price") or 0.0)
-                except Exception:
-                    pass
-        mv = {}
-        pos_now = getattr(self.broker, "positions", {}) or {}
-        for s, p in pos_now.items():
-            mv[s] = abs(getattr(p, "qty", 0)) * quotes.get(s, getattr(p, "avg_price", 0.0))
+            if s in quotes:
+                continue
+            try:
+                px = _usable_price(
+                    self.gateway.live_quote(s, _asset_val(self._asset(s))).get("price"))
+            except Exception as e:  # noqa: BLE001
+                px, note = None, str(e)
+            else:
+                note = "报价为空/NaN"
+            if px is None:
+                errors.append("持仓 %s 取价失败(%s)：本轮市值按成本价标记，"
+                              "权益仅供参考，且止损/止盈不会触发" % (s, note))
+            else:
+                quotes[s] = px
+        mv = self._mark_to_market(quotes)
         try:
             acct = self.broker.get_account(mv)
         except Exception as e:
@@ -291,9 +346,7 @@ class LiveEngine:
             except Exception as e:
                 actions.append({"symbol": sym, "action": "error", "side": side,
                                 "qty": abs(delta), "price": px, "reason": str(e)})
-        mv2 = {}
-        for s, p in (getattr(self.broker, "positions", {}) or {}).items():
-            mv2[s] = abs(getattr(p, "qty", 0)) * quotes.get(s, getattr(p, "avg_price", 0.0))
+        mv2 = self._mark_to_market(quotes)
         try:
             acct2 = self.broker.get_account(mv2)
         except Exception as e:
