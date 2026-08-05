@@ -242,12 +242,63 @@ def test_gitattributes_pins_launcher_eol():
     assert "*.bat text eol=crlf" in text, ".gitattributes 未把 *.bat 锁成 CRLF"
 
 
+def _tracked_root_launchers():
+    """git 索引里位于仓库根目录的 .bat / .sh 启动脚本。
+
+    用 git 索引而不是 os.listdir，是为了不把开发者本地的临时 scratch.bat 算进来 ——
+    只有真正提交进仓库、会跟着 clone 分发给用户的脚本才是"对外承诺的入口"。
+
+    必须用 `-z`：默认输出会把非 ASCII 路径转义成 `"\345\220\257..."` 八进制形式，
+    本仓库的中文名入口 `启动量化终端.bat` 正好会踩中，比对时永远对不上。
+    `-z` 输出原始 UTF-8 字节并以 NUL 分隔，再显式按 UTF-8 解码，绕开 Windows
+    上 text=True 按 GBK 解码的坑。
+    """
+    r = subprocess.run(
+        ["git", "ls-files", "-z", "--", "*.bat", "*.sh"],
+        cwd=ROOT, capture_output=True, timeout=60,
+    )
+    if r.returncode != 0:
+        return None
+    names = r.stdout.decode("utf-8").split("\0")
+    return sorted(n for n in names if n and "/" not in n)
+
+
+def test_launcher_lists_cover_every_shipped_script():
+    """BAT_FILES / SH_FILES 必须与仓库里实际存在的根级启动脚本完全一致。
+
+    本模块所有的入口体检（BOM、纯 ASCII、cmd 实跑、LF 换行、git 可执行位）都是
+    对着这两个**手工维护**的名单做参数化的。名单一旦和磁盘脱节，保护就会静默消失：
+
+    - 少写一个（新增了 `foo.bat` 却忘了登记）—— 没有任何用例会报错，这个新入口
+      带 BOM、混中文、写死 python 路径统统查不出来，直到用户双击才炸；
+    - 多写一个（文件删了名单没删）—— 由 test_declared_launchers_exist 兜住。
+
+    前一种是真正危险的方向：漏检不会变红，只会变成"我们以为测了"。本用例把名单
+    双向钉死到 git 索引上，让"加了入口忘了登记"当场失败。
+    """
+    tracked = _tracked_root_launchers()
+    if tracked is None:
+        pytest.skip("git 不可用")
+    declared = sorted(BAT_FILES + SH_FILES)
+    assert declared == tracked, (
+        f"启动入口名单与仓库实际内容不一致：名单={declared}，仓库={tracked}。\n"
+        "新增入口脚本时必须同步登记到 BAT_FILES / SH_FILES，否则该入口不受任何"
+        "体检用例保护（BOM / 非 ASCII / 写死路径 / CRLF / 缺可执行位都查不出来）。"
+    )
+
+
 def test_no_dangling_launcher_references():
-    """README 和各启动脚本不得引用已不存在的启动文件。
+    """README 和各启动脚本不得引用已不存在的启动文件（文档 -> 磁盘方向）。
 
     真实故障：一次"入口整合"把 `start.bat` / `start.sh` 删掉了，而 README 里仍有
     "双击 start.bat / 运行 start.sh" 的说明 —— 用户照做就是文件不存在。文档与磁盘
     上的真实入口必须同步，本用例负责钉死这一点。
+
+    除 .bat / .sh 外，还覆盖 README 里所有 `python xxx.py` / `streamlit run xxx.py`
+    形式的可执行命令：README 的"快速开始/测试"整节都是让用户照着敲的命令行，
+    指向被删除或改名的脚本时同样是"照做就报错"，属于同一类故障。
+    （只认带 `python` / `streamlit run` 前缀的，避免把模块清单里的 `data/gateway.py`
+    这类结构说明误判成可执行入口。）
     """
     import re
 
@@ -255,16 +306,44 @@ def test_no_dangling_launcher_references():
     # 先抹掉脚本里的路径前缀（cmd 的 %~dp0、shell 的 ./ 等），只留文件名
     prefix = re.compile(r"%~dp0|\$\{?BASEDIR\}?/|\./")
     pattern = re.compile(r"([\w\u4e00-\u9fff\-]+\.(?:bat|sh))\b")
+    runnable = re.compile(
+        r"(?:python3?|streamlit run)\s+"
+        r"((?:[\w\u4e00-\u9fff.\-]+/)*[\w\u4e00-\u9fff.\-]+\.py)"
+    )
     dangling: list[str] = []
     for src in sources:
         src_path = os.path.join(ROOT, src)
         if not os.path.exists(src_path):
             continue
         text = prefix.sub(" ", open(src_path, encoding="utf-8").read())
-        for ref in set(pattern.findall(text)):
+        refs = set(pattern.findall(text)) | set(runnable.findall(text))
+        for ref in refs:
             if not os.path.exists(os.path.join(ROOT, ref)):
                 dangling.append(f"{src} -> {ref}")
     assert not dangling, "引用了不存在的启动脚本：" + "; ".join(sorted(dangling))
+
+
+def test_every_shipped_launcher_is_documented():
+    """反向：磁盘上发出去的每个启动脚本，README 都必须有说明（磁盘 -> 文档方向）。
+
+    test_no_dangling_launcher_references 只挡住"文档提到但磁盘没有"。反过来
+    "磁盘有但文档没提"同样是缺陷，而且更隐蔽：
+
+    - 新加的入口没人知道怎么用，等于白加；
+    - 做入口整合时删了文档说明却漏删文件，会留下一个无人维护的僵尸入口 ——
+      用户偏偏可能双击到它。
+
+    两个方向合起来，才是真正的"文档 <-> 磁盘一致"。
+    """
+    tracked = _tracked_root_launchers()
+    if tracked is None:
+        pytest.skip("git 不可用")
+    readme = open(os.path.join(ROOT, "README.md"), encoding="utf-8").read()
+    undocumented = [name for name in tracked + ["start.py"] if name not in readme]
+    assert not undocumented, (
+        f"这些启动入口存在于仓库但 README 只字未提：{undocumented}。"
+        "要么在 README 的启动入口清单里补上说明，要么把文件删掉。"
+    )
 
 
 def test_candidate_pythons_are_real_and_deduped(start_mod):
