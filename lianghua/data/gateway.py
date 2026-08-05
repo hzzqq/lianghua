@@ -789,8 +789,14 @@ class DataGateway:
     def live_quote(self, symbol: str, asset: str | None = None) -> dict:
         """实时快照（最新价）。优先 AKShare 实时接口，失败降级到最后收盘/演示价。
 
-        返回 {"symbol", "price", "source"}，source ∈ {akshare, last_close, none}。
+        返回 {"symbol", "price", "source"}，source ∈ {akshare, last_close, demo, none}。
         用于实盘引擎的市值标记与决策。
+
+        **每条返回路径都会同步刷新 ``last_source`` / ``last_was_demo``**。这两个字段是
+        UI（``gw_fetch``）与实盘引擎判断"这个价能不能信"的唯一依据，一旦某条路径忘了写，
+        调用方读到的就是上一次无关调用留下的陈旧标志：真实报价被误报成"演示数据"，
+        或者更危险的——报价整体失败（price=NaN）却仍显示上一次的 last_was_demo=False，
+        用户看不到任何降级提示。
         """
         at = AssetType(asset) if isinstance(asset, str) else (asset or detect_asset_type(symbol))
         try:
@@ -803,11 +809,12 @@ class DataGateway:
                 df = ak.stock_zh_a_spot_em()
                 row = df[df["代码"] == code]
             if not row.empty:
+                self.last_source, self.last_was_demo = "akshare", False
                 return {"symbol": symbol,
                         "price": float(row.iloc[0]["最新价"]),
                         "source": "akshare"}
-        except Exception:
-            pass
+        except Exception as exc:  # noqa: BLE001 - 实时源不可用是常态，降级到日线收盘
+            self._note_error(f"live_quote({symbol}) 实时源", exc)
         # 降级：最近日线收盘
         end = pd.Timestamp.now().strftime("%Y-%m-%d")
         start = (pd.Timestamp.now() - pd.Timedelta(days=10)).strftime("%Y-%m-%d")
@@ -820,6 +827,11 @@ class DataGateway:
                 self.last_source, self.last_was_demo = src, (src == "demo")
                 return {"symbol": symbol, "price": float(df["close"].iloc[-1]),
                         "source": src}
-        except Exception:
-            pass
+        except Exception as exc:  # noqa: BLE001 - 兜底见下方 source=none
+            self._note_error(f"live_quote({symbol}) 日线降级", exc)
+        # 彻底取不到价：last_was_demo=False 表示"这不是假数据"，但 last_source="none"
+        # 才是真相——价格是 NaN，任何拿它做市值标记的调用方都必须先看 last_source。
+        self.last_source, self.last_was_demo = "none", False
+        logger.warning("标的 %s 实时报价与日线收盘均不可用，返回 NaN；原因: %s",
+                       symbol, "; ".join(self._last_errors[-3:]) or "未知")
         return {"symbol": symbol, "price": float("nan"), "source": "none"}
