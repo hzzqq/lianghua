@@ -62,6 +62,7 @@ from lianghua.core.capabilities import list_capabilities, summary_counts
 from lianghua.option.strategy import (OPTION_COMBO_REGISTRY, get_option_combo, payoff_curve)
 from lianghua.data.sources import list_sources, fetch_from, last_error
 from lianghua.data.universe import list_universes, get_universe
+from lianghua.data.symbol_name import get_symbol_name, build_name_table
 from lianghua.execution.brokers import make_broker
 from lianghua.execution.orders import bracket_order, evaluate_bracket
 import inspect, importlib, pkgutil
@@ -137,6 +138,14 @@ with st.sidebar:
 
 
 # ---------------- 通用辅助 ----------------
+def render_symbol_name(symbol: str, asset: str | None = None):
+    """在标的代码输入框下方渲染其中文名称。"""
+    if not symbol:
+        return
+    name = get_symbol_name(symbol, asset)
+    st.caption(f"**标的名称**：{name}")
+
+
 def equity_chart(equity: pd.Series, title: str = "组合净值"):
     eq = pd.Series(equity).astype(float) if equity is not None else pd.Series(dtype=float)
     if len(eq) == 0 or not np.isfinite(eq).any():
@@ -176,6 +185,7 @@ def page_single():
         "option": "如 510050C3000.SH（50ETF购）/ 510050P3000.SH（沽）",
     }
     symbol = st.text_input("标的代码", value="600519.SH", help=hints[asset], key="s_symbol")
+    render_symbol_name(symbol, asset)
     c1, c2 = st.columns(2)
     with c1:
         start = st.date_input("开始日期", value=pd.to_datetime("2023-01-01"), key="s_start")
@@ -211,6 +221,7 @@ def page_basket():
     st.caption("输入一篮子标的与权重（每行：代码,权重），按归一化价格做加权组合回测。")
     default = "600519.SH,0.4\n510300.SH,0.3\n000300.SH,0.3"
     txt = st.text_area("标的与权重", value=default, height=120)
+    st.dataframe(build_name_table(txt), use_container_width=True)
     c1, c2, c3 = st.columns(3)
     with c1:
         start = st.date_input("开始", value=pd.to_datetime("2023-01-01"), key="b_start")
@@ -252,6 +263,16 @@ def page_orchestrator():
                "510300.SH,fund,momentum,0.4\n"
                "RB0.SHF,future,breakout,0.2")
     txt = st.text_area("计划(代码,资产,策略,权重)", value=default, height=130)
+    # 解析出代码列用于显示名称（该文本格式第1列为代码，第2列为资产）
+    _plan_lines = [line.split(",") for line in txt.strip().splitlines() if line.strip()]
+    _plan_syms = [(parts[0].strip(), parts[1].strip() if len(parts) > 1 else None)
+                  for parts in _plan_lines if parts[0].strip()]
+    if _plan_syms:
+        st.dataframe(
+            pd.DataFrame([{"标的代码": s, "标的名称": get_symbol_name(s, a), "资产": a or ""}
+                          for s, a in _plan_syms]),
+            use_container_width=True,
+        )
     c1, c2 = st.columns(2)
     with c1:
         init_cash = st.number_input("初始资金", value=1_000_000, step=100_000, key="o_cash")
@@ -323,7 +344,9 @@ def page_future_spread():
     c1, c2 = st.columns(2)
     with c1:
         near = st.text_input("近月合约", value="RB2410.SHF", key="fs_near")
+        render_symbol_name(near, "future")
         far = st.text_input("远月合约", value="RB2501.SHF", key="fs_far")
+        render_symbol_name(far, "future")
     with c2:
         start = st.date_input("开始", value=pd.to_datetime("2023-01-01"), key="fs_start")
         end = st.date_input("结束", value=pd.to_datetime("2023-12-31"), key="fs_end")
@@ -363,6 +386,7 @@ def page_fund():
     st.caption("输入若干基金代码（每行一个），自动拉取净值做动量/波动/回撤/夏普加权打分排名。")
     default = "510300.SH\n110011.OF\n161725.OF"
     txt = st.text_area("基金代码列表", value=default, height=100)
+    st.dataframe(build_name_table(txt, default_asset="fund"), use_container_width=True)
     c1, c2, c3 = st.columns(3)
     with c1:
         start = st.date_input("开始", value=pd.to_datetime("2022-01-01"), key="fd_start")
@@ -401,6 +425,7 @@ def page_var():
     st.header("风险度量 · VaR / CVaR")
     st.caption("先对单标的回测得到收益序列，再计算历史/参数 VaR 与 CVaR（期望损失）。")
     symbol = st.text_input("标的代码", value="600519.SH", key="v_symbol")
+    render_symbol_name(symbol, "stock")
     strategy = st.selectbox("策略", SUPPORTED["stock"], index=0, key="v_strat")
     c1, c2 = st.columns(2)
     with c1:
@@ -426,6 +451,7 @@ def page_vectorized():
     st.header("向量化回测（加速）")
     st.caption("纯 pandas 向量化信号→持仓→净值，适合大样本快速扫描。")
     symbol = st.text_input("标的代码", value="600519.SH", key="vb_symbol")
+    render_symbol_name(symbol, "stock")
     strategy = st.selectbox("策略", STRATEGY_NAMES, index=0, key="vb_strat")
     c1, c2, c3 = st.columns(3)
     with c1:
@@ -453,6 +479,7 @@ def page_notify():
     st.header("实盘信号推送")
     st.caption("把交易信号推送到本地日志（可选 Webhook）。对齐 Broker 接口风格。")
     symbol = st.text_input("标的代码", value="600519.SH", key="n_symbol")
+    render_symbol_name(symbol, "stock")
     action = st.selectbox("动作", ["BUY", "SELL", "HOLD"], key="n_action")
     price = st.number_input("价格", value=0.0, key="n_price")
     strategy = st.text_input("策略名", value="sma_cross", key="n_strat")
@@ -478,6 +505,7 @@ def page_montecarlo():
     st.header("蒙特卡洛稳健性模拟")
     st.caption("对历史回测权益曲线做重采样，评估策略收益的尾部分布与破产概率。")
     symbol = st.text_input("标的代码", value="600519.SH", key="mc_symbol")
+    render_symbol_name(symbol, "stock")
     strategy = st.selectbox("策略", SUPPORTED["stock"], index=0, key="mc_strat")
     c1, c2, c3 = st.columns(3)
     with c1:
@@ -518,6 +546,7 @@ def page_param():
     st.header("参数优化 · 网格 / Walk-forward")
     st.caption("以 SMA 双均线为例，遍历快慢窗口组合寻找更优参数；walk-forward 评估样本外稳健性。")
     symbol = st.text_input("标的代码", value="600519.SH", key="pa_symbol")
+    render_symbol_name(symbol, "stock")
     c1, c2 = st.columns(2)
     with c1:
         start = st.date_input("开始", value=pd.to_datetime("2023-01-01"), key="pa_start")
@@ -566,6 +595,7 @@ def page_html():
     st.header("回测 HTML 报告")
     st.caption("生成单文件 HTML 回测报告（内联 SVG 曲线 + 指标卡 + 交易表 + 可选蒙特卡洛），可预览并下载。")
     symbol = st.text_input("标的代码", value="600519.SH", key="h_symbol")
+    render_symbol_name(symbol, "stock")
     strategy = st.selectbox("策略", SUPPORTED["stock"], index=0, key="h_strat")
     c1, c2 = st.columns(2)
     with c1:
@@ -612,6 +642,7 @@ def page_strategies():
     c1, c2 = st.columns(2)
     with c1:
         symbol = st.text_input("标的代码", "600519.SH", key="sl_symbol")
+        render_symbol_name(symbol, "stock")
     with c2:
         strat = st.selectbox("策略", STRATEGY_NAMES, index=0, key="sl_strat")
     start = str(st.date_input("开始", datetime.date(2024, 1, 1), key="sl_start"))
@@ -671,6 +702,7 @@ def page_factor():
     st.header("🔬 因子研究")
     st.caption("内置因子 → IC / 多空收益（演示随机因子）")
     symbol = st.text_input("标的代码（取真实/演示价格序列）", "600519.SH")
+    render_symbol_name(symbol, "stock")
     start = str(st.date_input("开始", datetime.date(2023, 1, 1)))
     end = str(st.date_input("结束", datetime.date(2023, 12, 31)))
     if st.button("运行因子研究"):
@@ -704,6 +736,7 @@ def page_indicator_lab():
     st.caption("动态读取全部技术指标（共 %d 个，注册表驱动），选一个在演示行情上运行并绘图。" % len(INDICATOR_FUNCS))
     name = st.selectbox("指标", sorted(INDICATOR_FUNCS.keys()))
     symbol = st.text_input("标的代码", "600519.SH", key="il_sym")
+    render_symbol_name(symbol, "stock")
     start = str(st.date_input("开始", datetime.date(2023, 1, 1), key="il_start"))
     end = str(st.date_input("结束", datetime.date(2023, 12, 31), key="il_end"))
     if st.button("▶ 运行指标", key="il_run"):
@@ -747,6 +780,7 @@ def page_perf_risk():
     with tab2:
         rname = st.selectbox("风险函数", sorted(RISK_FUNCS.keys()))
     symbol = st.text_input("标的代码", "600519.SH", key="pr_sym")
+    render_symbol_name(symbol, "stock")
     start = str(st.date_input("开始", datetime.date(2023, 1, 1), key="pr_start"))
     end = str(st.date_input("结束", datetime.date(2023, 12, 31), key="pr_end"))
     if st.button("▶ 运行", key="pr_run"):
@@ -785,6 +819,7 @@ def page_data_exec():
     st.write("可用源：", list_sources())
     src = st.selectbox("选择数据源", list_sources())
     sym = st.text_input("标的代码", "600519.SH", key="de_sym")
+    render_symbol_name(sym, "stock")
     if st.button("▶ 取数预览", key="de_fetch"):
         df = fetch_from(src, sym, "2023-01-01", "2023-06-30", asset=AssetType.STOCK)
         if df is None or df.empty:
@@ -844,6 +879,9 @@ def page_live():
     broker_kind = st.selectbox("Broker 类型", ["paper", "sim", "qmt", "pt"])
     strategy = st.selectbox("策略", STRATEGY_NAMES)
     symbols = st.text_input("标的（逗号分隔）", "600519.SH,000300.SH")
+    _syms = [s.strip() for s in symbols.split(",") if s.strip()]
+    if _syms:
+        st.caption("**标的名称**：" + "｜".join(f"{s} {get_symbol_name(s)}" for s in _syms))
     capital = st.number_input("资金（元）", min_value=10000, value=1000000, step=10000)
     lookback = st.number_input("回看交易日", min_value=20, value=120, step=10)
     max_order_value = st.number_input("单笔上限（元，0=不限）", min_value=0, value=200000, step=10000)
@@ -928,6 +966,16 @@ def page_multi():
 
     st.subheader("① 多账户路由（配置驱动）")
     _cfg = st.text_area("多账户配置 JSON", value=_MULTI_JSON, height=220)
+    try:
+        _c = _json.loads(_cfg)
+        _multi_syms = [str(s).strip() for s in _c.get("symbols", []) if str(s).strip()]
+        if _multi_syms:
+            st.dataframe(
+                pd.DataFrame([{"标的代码": s, "标的名称": get_symbol_name(s)} for s in _multi_syms]),
+                use_container_width=True,
+            )
+    except Exception:
+        pass
     if st.button("构建并运行一次多账户调仓", key="multi_run"):
         try:
             _c = _json.loads(_cfg)
@@ -941,6 +989,7 @@ def page_multi():
 
     st.subheader("② 盘中分钟信号探针")
     _sym = st.text_input("标的代码", value="600519.SH", key="intraday_sym")
+    render_symbol_name(_sym, "stock")
     _freq = st.selectbox("分钟频率", ["1min", "5min", "15min"], index=1)
     if st.button("探测分钟信号", key="intraday_probe"):
         try:
