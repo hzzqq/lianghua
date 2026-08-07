@@ -8,11 +8,24 @@ BaseBroker.submit。支持股票/期货/期权（asset_type 透传）。
 - evaluate_bracket 纠正 SELL(空) 场景下止损/止盈触发方向的隐性反向 bug。
 - oco_order 的撤单腿不再用魔法价 0.0，改为显式 cancel 标记 dict。
 - 新增 trailing_stop_order / evaluate_trailing_stop（追踪止损，机构常用）。
+
+非有限值（NaN/inf）守卫：evaluate_* 全部基于 `price >= level` 这类比较，
+对 NaN 恒为 False —— 坏行情下一条腿都不触发，**止损静默失效**；而 inf 行情
+更糟，会让 `new_stop > stop_price` 成立，把追踪止损的 stop_price 永久写成
+inf，此后每 tick 都返回一张 price=inf 的平仓单。这些函数返回 list/Order，
+没有表达"我算不出来"的出口，因此非法行情一律显式抛 ValueError。
 """
 from __future__ import annotations
 
 from .brokers.base import Order
 from ..core.assets import AssetType
+from ..core.numeric import is_finite_num
+
+
+def _check_price(value, name: str) -> float:
+    if not is_finite_num(value):
+        raise ValueError(f"{name} 必须为有限数，收到 {value!r}")
+    return float(value)
 
 
 def bracket_order(symbol: str, side: str, qty: int, entry: float,
@@ -28,6 +41,9 @@ def bracket_order(symbol: str, side: str, qty: int, entry: float,
     """
     side = side.upper()
     opp = "SELL" if side == "BUY" else "BUY"
+    entry = _check_price(entry, "entry")
+    stop_loss = _check_price(stop_loss, "stop_loss")
+    take_profit = _check_price(take_profit, "take_profit")
     if side == "BUY":
         if not (stop_loss < entry < take_profit):
             raise ValueError(
@@ -68,6 +84,7 @@ def evaluate_bracket(bkt: dict, market_price: float) -> list[str]:
     BUY: 止损在下方(price<=stop)，止盈在上方(price>=target)；
     SELL: 止损在上方(price>=stop)，止盈在下方(price<=target)。
     """
+    market_price = _check_price(market_price, "market_price")
     fired: list[str] = []
     entry = bkt.get("entry")
     if entry is None:
@@ -91,6 +108,7 @@ def evaluate_bracket(bkt: dict, market_price: float) -> list[str]:
 
 def evaluate_oco(oco: dict, market_price: float) -> list[str]:
     """评估 OCO 触发：价格先到哪一档即触发该腿。"""
+    market_price = _check_price(market_price, "market_price")
     if "a" in oco and market_price <= oco["a"].price:
         return ["a"]
     if "b" in oco and market_price >= oco["b"].price:
@@ -109,8 +127,10 @@ def trailing_stop_order(symbol: str, side: str, qty: int, activation_price: floa
     返回可变 state dict，交由 evaluate_trailing_stop 逐 tick 评估并更新 stop_price。
     """
     side = side.upper()
+    trailing_pct = _check_price(trailing_pct, "trailing_pct")
     if not (0.0 < trailing_pct < 1.0):
         raise ValueError("trailing_pct 必须介于 0 与 1 之间（如 0.05 表示 5%）")
+    activation_price = _check_price(activation_price, "activation_price")
     if activation_price <= 0:
         raise ValueError("activation_price 必须为正")
     init_stop = (activation_price * (1 - trailing_pct) if side == "BUY"
@@ -133,7 +153,10 @@ def evaluate_trailing_stop(state: dict, market_price: float):
 
     激活后：BUY 止损随价格上涨而上移、价格跌破止损价触发；
            SELL 止损随价格下跌而下移、价格涨破止损价触发。
+
+    非法行情先抛错再动状态：一条 inf 行情就能把 stop_price 永久污染。
     """
+    market_price = _check_price(market_price, "market_price")
     side = state["side"]
     if not state.get("activated"):
         if (side == "BUY" and market_price >= state["activation_price"]) or \

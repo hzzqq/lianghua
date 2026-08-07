@@ -15,6 +15,7 @@ import time
 import numpy as np
 
 from ..core.assets import AssetType, detect_asset_type
+from ..core.numeric import positive_finite
 from .brokers.base import Order
 from .pre_trade import pre_trade_check
 from .order_book import OrderBook
@@ -32,15 +33,10 @@ def _usable_price(value) -> float | None:
     于是 NaN 会一路流进
       - 市值 ``qty * NaN`` -> 整个账户权益变成 NaN；
       - 止损/止盈比较（全部为 False）-> **持仓永远不会被止损**，且没有任何报错。
-    这里统一收口：只有有限的正数才算有效报价。
+    这里统一收口：只有有限的正数才算有效报价。返回 None 或正有限数，因此
+    ``_usable_price(a) or fallback`` 是安全的——朴素的 ``a or fallback`` 不是。
     """
-    try:
-        px = float(value)
-    except (TypeError, ValueError):
-        return None
-    if not np.isfinite(px) or px <= 0:
-        return None
-    return px
+    return positive_finite(value)
 
 
 def _resolve_strategy(name_or_fn):
@@ -194,7 +190,18 @@ class LiveEngine:
                 actions.append({"symbol": sym, "action": "exit_skip",
                                 "reason": "报价不可用，本轮止损/止盈未执行"})
                 continue
-            avg = float(getattr(pos, "avg_price", px) or px)
+            # `avg_price or px` 是同一个陷阱的另一半：NaN 成本价穿过 or 之后，
+            # 下面所有 sl/tp 比较又会恒为 False —— 报价这回是好的，止损照样失效。
+            raw_avg = getattr(pos, "avg_price", None)
+            avg = _usable_price(raw_avg)
+            if avg is None:
+                if raw_avg is None or raw_avg == 0:
+                    avg = px          # 成本价未初始化：沿用原语义回退到当前价
+                else:
+                    actions.append({"symbol": sym, "action": "exit_skip",
+                                    "reason": "持仓成本价不可用(%r)，本轮止损/止盈未执行"
+                                              % (raw_avg,)})
+                    continue
             if self.trailing_pct:
                 self._peak[sym] = max(self._peak.get(sym, px), px)
             hit = None
@@ -223,7 +230,9 @@ class LiveEngine:
                 continue
             try:
                 res = self.broker.submit(order)
-                fp = float(res.get("fill_price", px) or px)
+                # 柜台可能回报 NaN 成交价；`x or px` 拦不住 NaN，会把它当真实成交价记账。
+                # 与 step 下单路径一致：取不到有限回报价时退回决策价，绝不写 NaN 进账本。
+                fp = _usable_price(res.get("fill_price")) or px
                 oid = self.book.record(
                     sym, side, abs(qty), px,
                     asset=_asset_val(at),
@@ -328,7 +337,8 @@ class LiveEngine:
                 continue
             try:
                 res = self.broker.submit(order)
-                fp = float(res.get("fill_price", px) or px)
+                # 柜台可能回报 NaN 成交价；`x or px` 拦不住 NaN，会把它当真实成交价记账。
+                fp = _usable_price(res.get("fill_price")) or px
                 oid = self.book.record(sym, side, abs(int(delta)), px,
                                        asset=_asset_val(at),
                                        status=str(res.get("status", "filled")),

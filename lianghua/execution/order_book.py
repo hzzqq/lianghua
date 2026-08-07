@@ -2,11 +2,24 @@
 
 每笔经 LiveEngine 提交的订单都会 record 进 live_orders.db，可跨会话
 审计与对账。零重依赖（仅标准库 sqlite3）。
+
+账本是对账与绩效统计的唯一事实来源，所以数字入库前必须是有限的：原实现
+校验了 price 却漏了 fill_price，柜台回报一条 NaN 成交价即可直接落库，
+之后整段盈亏统计都会被这一行悄悄污染成 NaN。
 """
 from __future__ import annotations
 
 import datetime as _dt
 import sqlite3
+
+from ..core.numeric import is_finite_num
+
+
+def _finite_fill(value) -> float:
+    """成交价必须有限（0.0 表示"尚未成交"，合法）。"""
+    if not is_finite_num(value):
+        raise ValueError(f"fill_price 必须为有限数，收到 {value!r}")
+    return float(value)
 
 
 class OrderBook:
@@ -66,7 +79,7 @@ class OrderBook:
             "INSERT INTO orders(ts,symbol,side,qty,price,asset,status,"
             "fill_price,broker,detail) VALUES(?,?,?,?,?,?,?,?,?,?)",
             (ts, symbol, side, qty, price, asset, status,
-             float(fill_price), broker, str(detail)[:500]))
+             _finite_fill(fill_price), broker, str(detail)[:500]))
         return int(cur.lastrowid)
 
     def update(self, oid: int, status: str | None = None,
@@ -77,7 +90,7 @@ class OrderBook:
             args.append(status)
         if fill_price is not None:
             sets.append("fill_price=?")
-            args.append(float(fill_price))
+            args.append(_finite_fill(fill_price))
         if not sets:
             return
         args.append(int(oid))
