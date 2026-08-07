@@ -21,6 +21,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import time
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 APP = os.path.join(ROOT, "lianghua", "ui", "app.py")
@@ -88,6 +89,63 @@ def _port_in_use(host: str, port: int) -> bool:
         return s.connect_ex((probe_host, port)) == 0
 
 
+def _open_browser(url: str) -> None:
+    try:
+        import webbrowser
+        webbrowser.open(url)
+    except Exception:
+        pass
+
+
+def _start_daemon(py: str, args) -> int:
+    """后台（守护）模式：启动一个脱离当前控制台的 Streamlit 独立进程。
+
+    - 关闭命令行窗口不会影响服务（进程属于新进程组/新会话，不共享控制台）；
+    - 日志追加写 logs/terminal.log，PID 记录在项目根 terminal.pid；
+    - 端口就绪后自动打开浏览器。
+    """
+    log_dir = os.path.join(ROOT, "logs")
+    os.makedirs(log_dir, exist_ok=True)
+    log_path = os.path.join(log_dir, "terminal.log")
+    logf = open(log_path, "a", encoding="utf-8", errors="replace")
+
+    cmd = [
+        py, "-m", "streamlit", "run", APP,
+        "--server.port", str(args.port),
+        "--server.address", args.host,
+        "--server.headless", "true",
+    ]
+    kwargs: dict = {"stdin": subprocess.DEVNULL, "stdout": logf, "stderr": logf}
+    if os.name == "nt":
+        kwargs["creationflags"] = (
+            subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
+        )
+    else:
+        kwargs["start_new_session"] = True
+
+    proc = subprocess.Popen(cmd, **kwargs)
+    pid = proc.pid
+    with open(os.path.join(ROOT, "terminal.pid"), "w", encoding="utf-8") as f:
+        f.write(str(pid))
+
+    url = f"http://localhost:{args.port}"
+    print(f"🚀 量化终端已作为后台服务启动 (PID {pid})")
+    print(f"   地址: {url}")
+    print(f"   日志: logs/terminal.log")
+    print(f"   关闭本窗口不影响服务；停止服务请运行「停止量化终端.bat」。")
+
+    # 等待端口就绪后自动打开浏览器
+    deadline = time.time() + 20
+    while time.time() < deadline:
+        if _port_in_use(args.host, args.port):
+            _open_browser(url)
+            break
+        time.sleep(0.5)
+    else:
+        print(f"[警告] 20 秒内端口 {args.port} 未就绪，请查看 logs/terminal.log。")
+    return 0
+
+
 def main() -> int:
     # 启动器不该因为控制台编码（如 cp936 下输出 emoji）而崩掉
     for stream in (sys.stdout, sys.stderr):
@@ -101,6 +159,8 @@ def main() -> int:
     p.add_argument("--host", default="127.0.0.1",
                    help="监听地址 (默认 127.0.0.1 仅本机；用 0.0.0.0 开放局域网)")
     p.add_argument("--no-browser", action="store_true", help="无头模式，不尝试打开浏览器")
+    p.add_argument("--daemon", action="store_true",
+                   help="后台模式：以脱离控制台的独立进程运行，关闭命令行窗口不影响服务")
     args = p.parse_args()
 
     if not os.path.exists(APP):
@@ -117,10 +177,18 @@ def main() -> int:
         return 1
 
     if _port_in_use(args.host, args.port):
+        if args.daemon:
+            url = f"http://localhost:{args.port}"
+            print(f"[提示] 端口 {args.port} 已有终端在运行 → {url}")
+            _open_browser(url)
+            return 0
         print(f"[错误] 端口 {args.port} 已被占用（可能终端已在运行）。")
         print(f"  · 直接访问： http://localhost:{args.port}")
         print(f"  · 或换端口： python start.py --port {args.port + 1}")
         return 1
+
+    if args.daemon:
+        return _start_daemon(py, args)
 
     cmd = [
         py, "-m", "streamlit", "run", APP,

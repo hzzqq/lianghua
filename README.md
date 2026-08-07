@@ -219,8 +219,11 @@ print(payoff_curve(legs, 80, 120))
     找不到解释器或端口被占用时给出明确提示而不是报 `No module named streamlit`。
 - `run.bat` / `run.sh`：Windows / Git Bash / Linux / macOS 双击或命令行启动（转调 `start.py`，可透传参数）
   - 可用环境变量 `LIANGHUA_PYTHON=<解释器路径>` 指定解释器。
-- `启动量化终端.bat`：中文名双击入口，内部转调 `run.bat`（正文保持纯 ASCII —— `.bat` 里同时出现
-  `chcp 65001` 和多字节中文会让 cmd.exe 解析器按字节偏移读取时失步，把注释片段当命令执行而启动失败）
+- `启动量化终端.bat`：中文名双击入口，内部转调 `run.bat --daemon`（后台守护模式：服务脱离本窗口独立运行，
+  关闭窗口不影响服务；正文保持纯 ASCII —— `.bat` 里同时出现 `chcp 65001` 和多字节中文会让 cmd.exe
+  解析器按字节偏移读取时失步，把注释片段当命令执行而启动失败）
+- `停止量化终端.bat`：停止后台守护服务（优先按 `terminal.pid` 杀进程树，兜底按 8501 端口找监听进程）；
+  同样保持纯 ASCII，与 `启动量化终端.bat --daemon` 配对使用。
 - `lianghua/__main__.py`：`python -m lianghua` 直接拉起终端
 
 > 换行符由 `.gitattributes` 锁定：`*.sh` 强制 LF、`*.bat` 强制 CRLF。否则在
