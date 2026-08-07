@@ -24,12 +24,15 @@ import pytest
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # 所有对外承诺的启动入口都必须逐一体检：start.py 是核心入口（自动探测 streamlit 解释器），
 # run.bat / run.sh 是 Windows / Unix 主入口，启动量化终端.bat 是中文名双击入口。
+# 启动类入口（转调 start.py，会被 test_bat_actually_runs 实跑）。
 BAT_FILES = ["run.bat", "启动量化终端.bat"]
+# 停止类脚本：不转调 start.py，因此不参加 test_bat_actually_runs 的 --help 冒烟。
+STOP_BAT_FILES = ["停止量化终端.bat"]
 SH_FILES = ["run.sh"]
 BOM = b"\xef\xbb\xbf"
 
 
-@pytest.mark.parametrize("name", BAT_FILES + SH_FILES + ["start.py"])
+@pytest.mark.parametrize("name", BAT_FILES + STOP_BAT_FILES + SH_FILES + ["start.py"])
 def test_declared_launchers_exist(name):
     """清单里的启动入口必须真实存在。
 
@@ -54,7 +57,7 @@ def start_mod():
     return _load_start_module()
 
 
-@pytest.mark.parametrize("name", BAT_FILES)
+@pytest.mark.parametrize("name", BAT_FILES + STOP_BAT_FILES)
 def test_bat_has_no_utf8_bom(name):
     """.bat 文件不能有 BOM，否则 cmd.exe 第一行报错且 @echo off 不生效。"""
     path = os.path.join(ROOT, name)
@@ -65,7 +68,7 @@ def test_bat_has_no_utf8_bom(name):
     assert head != BOM, f"{name} 带 UTF-8 BOM，会导致 cmd.exe 启动报错"
 
 
-@pytest.mark.parametrize("name", BAT_FILES + SH_FILES + ["start.py"])
+@pytest.mark.parametrize("name", BAT_FILES + STOP_BAT_FILES + SH_FILES + ["start.py"])
 def test_no_machine_specific_python_path(name):
     """启动脚本不得写死某个用户的 python 绝对路径（换机器就废）。"""
     path = os.path.join(ROOT, name)
@@ -76,7 +79,7 @@ def test_no_machine_specific_python_path(name):
         assert bad not in text, f"{name} 写死了机器相关路径 {bad}"
 
 
-@pytest.mark.parametrize("name", BAT_FILES)
+@pytest.mark.parametrize("name", BAT_FILES + STOP_BAT_FILES)
 def test_bat_body_is_pure_ascii(name):
     """.bat 正文必须是纯 ASCII（文件名可以是中文，那是文件系统层面的事）。
 
@@ -279,7 +282,7 @@ def test_launcher_lists_cover_every_shipped_script():
     tracked = _tracked_root_launchers()
     if tracked is None:
         pytest.skip("git 不可用")
-    declared = sorted(BAT_FILES + SH_FILES)
+    declared = sorted(BAT_FILES + STOP_BAT_FILES + SH_FILES)
     assert declared == tracked, (
         f"启动入口名单与仓库实际内容不一致：名单={declared}，仓库={tracked}。\n"
         "新增入口脚本时必须同步登记到 BAT_FILES / SH_FILES，否则该入口不受任何"
@@ -302,7 +305,7 @@ def test_no_dangling_launcher_references():
     """
     import re
 
-    sources = ["README.md", "start.py", *BAT_FILES, *SH_FILES]
+    sources = ["README.md", "start.py", *BAT_FILES, *STOP_BAT_FILES, *SH_FILES]
     # 先抹掉脚本里的路径前缀（cmd 的 %~dp0、shell 的 ./ 等），只留文件名
     prefix = re.compile(r"%~dp0|\$\{?BASEDIR\}?/|\./")
     pattern = re.compile(r"([\w\u4e00-\u9fff\-]+\.(?:bat|sh))\b")
