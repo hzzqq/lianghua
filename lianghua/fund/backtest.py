@@ -5,6 +5,7 @@ T 日申请、T+1 确认，含申购费/赎回费。这里简化为即时按净�
 """
 from __future__ import annotations
 
+import math
 import pandas as pd
 
 from ..core.assets import AssetType, get_contract_spec
@@ -34,20 +35,26 @@ class FundBacktest:
         shares = 0.0
         equity, dates = [], []
         sig = signals.reindex(df.index).fillna(0)
+        last_equity = cash
         for i, row in df.iterrows():
             nav = float(row["close"])
-            s = int(sig.loc[i])
-            if s == 1 and shares == 0 and cash > 0:
-                cost = cash * (1 - self.buy_fee)
-                shares = cost / nav
-                self._log(row["date"], "BUY", nav, shares, cash * self.buy_fee)
-                cash = 0.0
-            elif s == -1 and shares > 0:
-                proceed = shares * nav * (1 - self.sell_fee)
-                self._log(row["date"], "SELL", nav, shares, proceed)
-                cash = proceed
-                shares = 0.0
-            equity.append(cash + shares * nav)
+            # 隐性修复：NAV 为 NaN/inf/<=0 时，shares=cost/nav 会污染整个权益曲线为
+            # NaN/inf，使 BacktestResult.stats 崩溃或产出静默错误指标。无效净值跳过交易，
+            # 沿用上一刻权益（持仓按最近有效净值标记）。
+            if math.isfinite(nav) and nav > 0:
+                s = int(sig.loc[i])
+                if s == 1 and shares == 0 and cash > 0:
+                    cost = cash * (1 - self.buy_fee)
+                    shares = cost / nav
+                    self._log(row["date"], "BUY", nav, shares, cash * self.buy_fee)
+                    cash = 0.0
+                elif s == -1 and shares > 0:
+                    proceed = shares * nav * (1 - self.sell_fee)
+                    self._log(row["date"], "SELL", nav, shares, proceed)
+                    cash = proceed
+                    shares = 0.0
+                last_equity = cash + shares * nav
+            equity.append(last_equity)
             dates.append(row["date"])
         eq = pd.Series(equity, index=pd.to_datetime(dates), name="equity")
         return BacktestResult(eq, self.trades, sig, df)
@@ -83,14 +90,18 @@ class DCABacktest:
         shares = 0.0
         equity, dates = [], []
         signals = pd.Series(0, index=df.index)
+        last_equity = cash
         for i, row in df.iterrows():
             nav = float(row["close"])
-            if i % self.period == 0 and cash >= self.amount:
-                invest = self.amount
-                shares += invest * (1 - self.buy_fee) / nav
-                cash -= invest
-                self._log(row["date"], nav, self.amount)
-            equity.append(cash + shares * nav)
+            # 同上：无效净值(非有限/<=0)跳过本期定投，沿用上一刻权益，避免 NaN/inf 污染。
+            if math.isfinite(nav) and nav > 0:
+                if i % self.period == 0 and cash >= self.amount:
+                    invest = self.amount
+                    shares += invest * (1 - self.buy_fee) / nav
+                    cash -= invest
+                    self._log(row["date"], nav, self.amount)
+                last_equity = cash + shares * nav
+            equity.append(last_equity)
             dates.append(row["date"])
         eq = pd.Series(equity, index=pd.to_datetime(dates), name="equity")
         return BacktestResult(eq, self.trades, signals, df)
