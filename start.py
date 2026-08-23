@@ -22,6 +22,7 @@ import socket
 import subprocess
 import sys
 import time
+import json
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 APP = os.path.join(ROOT, "lianghua", "ui", "app.py")
@@ -89,6 +90,58 @@ def _port_in_use(host: str, port: int) -> bool:
         return s.connect_ex((probe_host, port)) == 0
 
 
+# ---- 端口互斥锁：确保同一端口只被「本项目」占用，杜绝被 StockSignal 等其它
+#      8501 服务抢占后误判为「自己已在运行」而偷偷打开别人的页面。 ----
+LOCKFILE = os.path.join(ROOT, "terminal.lock")
+
+
+def _read_lock() -> dict | None:
+    try:
+        with open(LOCKFILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def _write_lock(port: int, pid: int) -> None:
+    with open(LOCKFILE, "w", encoding="utf-8") as f:
+        json.dump({"port": port, "pid": pid, "app": "lianghua"}, f)
+
+
+def _clear_lock() -> None:
+    try:
+        os.remove(LOCKFILE)
+    except OSError:
+        pass
+
+
+def _port_owned_by_us(port: int) -> bool:
+    """锁里记录的端口与当前一致，且该 PID 进程（含其子孙）确实在监听此端口。"""
+    lock = _read_lock()
+    if not lock or lock.get("port") != port:
+        return False
+    pid = lock.get("pid")
+    if not pid:
+        return False
+    try:
+        import psutil  # 可选依赖；没有就退化为「仅看端口占用」
+    except ImportError:
+        return True
+    try:
+        root = psutil.Process(pid)
+    except (psutil.Error, OSError):
+        return False
+    # 收集进程树（本进程 + 所有子孙），streamlit 的监听 socket 在子进程上
+    members = [root] + root.children(recursive=True)
+    listening = {
+        c.laddr.port
+        for p in members
+        for c in p.net_connections(kind="tcp")
+        if c.status == "LISTEN" and c.laddr
+    }
+    return port in listening
+
+
 def _open_browser(url: str) -> None:
     try:
         import webbrowser
@@ -127,6 +180,7 @@ def _start_daemon(py: str, args) -> int:
     pid = proc.pid
     with open(os.path.join(ROOT, "terminal.pid"), "w", encoding="utf-8") as f:
         f.write(str(pid))
+    _write_lock(args.port, pid)
 
     url = f"http://localhost:{args.port}"
     print(f"🚀 量化终端已作为后台服务启动 (PID {pid})")
@@ -177,14 +231,18 @@ def main() -> int:
         return 1
 
     if _port_in_use(args.host, args.port):
-        if args.daemon:
+        # 端口被占用：先判断是不是「我们自己」的 daemon 在跑。
+        if args.daemon and _port_owned_by_us(args.port):
             url = f"http://localhost:{args.port}"
-            print(f"[提示] 端口 {args.port} 已有终端在运行 → {url}")
+            print(f"[提示] 本终端后台服务已在运行 → {url}")
             _open_browser(url)
             return 0
-        print(f"[错误] 端口 {args.port} 已被占用（可能终端已在运行）。")
-        print(f"  · 直接访问： http://localhost:{args.port}")
-        print(f"  · 或换端口： python start.py --port {args.port + 1}")
+        # 端口被「别人」占用（如 StockSignal 等其它 8501 服务）→ 明确报错、绝不偷偷开浏览器
+        print(f"[错误] 端口 {args.port} 已被其它进程占用（不是本终端后台服务）。")
+        print(f"  · 请先停止占用该端口的服务（例如 StockSignal），或换端口：")
+        print(f"      python start.py --port {args.port + 1}")
+        print(f"  · 想知道是谁占用：在 PowerShell 运行")
+        print(f"      Get-NetTCPConnection -LocalPort {args.port} -State Listen | Select-Object OwningProcess")
         return 1
 
     if args.daemon:
