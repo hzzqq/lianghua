@@ -178,7 +178,9 @@ def test_today_is_never_treated_as_settled(cache_db):
     gw._from_akshare = lambda s, a, b, asset=None: _bars(start, end)
     after_close = gw.fetch("600000.SH", start, end, asset=AssetType.STOCK)
     assert gw.last_source != "cache", "请求区间含当天时不应命中缓存"
-    assert str(after_close["date"].max()) >= yday
+    # 以区间内最后一个交易日为基准（yday/今天可能是周末，合成数据只含交易日）
+    last_bday = pd.bdate_range(start, end).strftime("%Y-%m-%d")[-1]
+    assert str(after_close["date"].max()) == last_bday
 
     # 但纯历史区间仍应正常命中缓存，别把优化整个废掉
     hist_end = (today - pd.Timedelta(days=10)).strftime("%Y-%m-%d")
