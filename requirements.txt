@@ -3,5 +3,6 @@ numpy>=1.24
 streamlit>=1.30
 plotly>=5.18
 akshare>=1.12
+psutil>=5.9  # 启动器端口互斥锁(进程树校验)依赖；缺失时退化为仅比对端口
 # 可选：复用 Backtrader 生态（核心引擎无需它也能跑）
 # backtrader>=1.9.78.123
