@@ -17,3 +17,8 @@ __pycache__/
 .pytest_tmp3/
 nul
 .workbuddy/
+
+# 启动器运行产物（后台进程锁/pid、导出目录）——勿提交
+terminal.lock
+terminal.pid
+outputs/
