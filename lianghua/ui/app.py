@@ -24,7 +24,8 @@ LOGO_PATH = ROOT / "assets" / "logo.png"
 
 from lianghua.core.assets import AssetType
 from lianghua.backtest.runner import run_backtest, SUPPORTED
-from lianghua.strategy.registry import get_strategy as reg_get_strategy, STRATEGY_NAMES
+from lianghua.strategy.registry import (get_strategy as reg_get_strategy, STRATEGY_NAMES,
+                                        STRATEGY_CN, STRATEGY_DETAIL)
 from lianghua.portfolio.registry import get_optimizer as reg_get_optimizer, OPTIMIZER_NAMES
 from lianghua.backtest.basket import basket_backtest
 from lianghua.backtest.orchestrator import run_plan
@@ -62,7 +63,7 @@ from lianghua.core.capabilities import list_capabilities, summary_counts
 from lianghua.option.strategy import (OPTION_COMBO_REGISTRY, get_option_combo, payoff_curve)
 from lianghua.data.sources import list_sources, fetch_from, last_error
 from lianghua.data.universe import list_universes, get_universe
-from lianghua.data.symbol_name import get_symbol_name, build_name_table
+from lianghua.data.symbol_name import get_symbol_name, build_name_table, search_symbols
 from lianghua.execution.brokers import make_broker
 from lianghua.execution.orders import bracket_order, evaluate_bracket
 import inspect, importlib, pkgutil
@@ -133,7 +134,7 @@ with st.sidebar:
         "参数优化", "HTML报告", "信号推送",
         "策略库", "组合优化", "因子研究",
         "指标实验室", "绩效风险分析", "数据执行能力", "能力总览",
-        "实盘交易", "多账户与定时",
+        "实盘交易", "多账户与定时", "实时行情",
     ])
 
 
@@ -144,6 +145,17 @@ def render_symbol_name(symbol: str, asset: str | None = None):
         return
     name = get_symbol_name(symbol, asset)
     st.caption(f"**标的名称**：{name}")
+
+
+def strategy_selectbox(label: str, keys, key=None):
+    """策略下拉（全中文展示），返回选中的英文 key。
+
+    keys 可为 STRATEGY_NAMES 或 SUPPORTED[asset] 等英文 key 列表。
+    """
+    cn_options = [STRATEGY_CN.get(k, k) for k in keys]
+    cn_to_key = {STRATEGY_CN.get(k, k): k for k in keys}
+    sel = st.selectbox(label, cn_options, index=0, key=key)
+    return cn_to_key[sel]
 
 
 def equity_chart(equity: pd.Series, title: str = "组合净值"):
@@ -191,7 +203,7 @@ def page_single():
         start = st.date_input("开始日期", value=pd.to_datetime("2023-01-01"), key="s_start")
     with c2:
         end = st.date_input("结束日期", value=pd.to_datetime("2024-12-31"), key="s_end")
-    strategy = st.selectbox("策略", SUPPORTED[asset], index=0, key="s_strat")
+    strategy = strategy_selectbox("策略", SUPPORTED[asset], key="s_strat")
     init_cash = st.number_input("初始资金(元)", value=1_000_000, step=100_000, key="s_cash")
     stop_loss = st.number_input("止损线", value=0.10, format="%.2f", key="s_sl")
     run = st.button("▶ 运行回测", type="primary", key="s_run")
@@ -426,7 +438,7 @@ def page_var():
     st.caption("先对单标的回测得到收益序列，再计算历史/参数 VaR 与 CVaR（期望损失）。")
     symbol = st.text_input("标的代码", value="600519.SH", key="v_symbol")
     render_symbol_name(symbol, "stock")
-    strategy = st.selectbox("策略", SUPPORTED["stock"], index=0, key="v_strat")
+    strategy = strategy_selectbox("策略", SUPPORTED["stock"], key="v_strat")
     c1, c2 = st.columns(2)
     with c1:
         start = st.date_input("开始", value=pd.to_datetime("2023-01-01"), key="v_start")
@@ -452,7 +464,7 @@ def page_vectorized():
     st.caption("纯 pandas 向量化信号→持仓→净值，适合大样本快速扫描。")
     symbol = st.text_input("标的代码", value="600519.SH", key="vb_symbol")
     render_symbol_name(symbol, "stock")
-    strategy = st.selectbox("策略", STRATEGY_NAMES, index=0, key="vb_strat")
+    strategy = strategy_selectbox("策略", STRATEGY_NAMES, key="vb_strat")
     c1, c2, c3 = st.columns(3)
     with c1:
         start = st.date_input("开始", value=pd.to_datetime("2023-01-01"), key="vb_start")
@@ -506,7 +518,7 @@ def page_montecarlo():
     st.caption("对历史回测权益曲线做重采样，评估策略收益的尾部分布与破产概率。")
     symbol = st.text_input("标的代码", value="600519.SH", key="mc_symbol")
     render_symbol_name(symbol, "stock")
-    strategy = st.selectbox("策略", SUPPORTED["stock"], index=0, key="mc_strat")
+    strategy = strategy_selectbox("策略", SUPPORTED["stock"], key="mc_strat")
     c1, c2, c3 = st.columns(3)
     with c1:
         start = st.date_input("开始", value=pd.to_datetime("2023-01-01"), key="mc_start")
@@ -596,7 +608,7 @@ def page_html():
     st.caption("生成单文件 HTML 回测报告（内联 SVG 曲线 + 指标卡 + 交易表 + 可选蒙特卡洛），可预览并下载。")
     symbol = st.text_input("标的代码", value="600519.SH", key="h_symbol")
     render_symbol_name(symbol, "stock")
-    strategy = st.selectbox("策略", SUPPORTED["stock"], index=0, key="h_strat")
+    strategy = strategy_selectbox("策略", SUPPORTED["stock"], key="h_strat")
     c1, c2 = st.columns(2)
     with c1:
         start = st.date_input("开始", value=pd.to_datetime("2023-01-01"), key="h_start")
@@ -644,9 +656,15 @@ def page_strategies():
         symbol = st.text_input("标的代码", "600519.SH", key="sl_symbol")
         render_symbol_name(symbol, "stock")
     with c2:
-        strat = st.selectbox("策略", STRATEGY_NAMES, index=0, key="sl_strat")
+        # 下拉展示中文名，内部映射回英文 key
+        cn_options = [STRATEGY_CN.get(n, n) for n in STRATEGY_NAMES]
+        cn_to_key = {STRATEGY_CN.get(n, n): n for n in STRATEGY_NAMES}
+        sel_cn = st.selectbox("策略", cn_options, index=0, key="sl_strat")
+        strat = cn_to_key[sel_cn]
     start = str(st.date_input("开始", datetime.date(2024, 1, 1), key="sl_start"))
     end = str(st.date_input("结束", datetime.date(2024, 6, 30), key="sl_end"))
+    # 展示选中策略的详细描述（中文）
+    st.info(f"**{STRATEGY_CN.get(strat, strat)}** — {STRATEGY_DETAIL.get(strat, '')}")
     if st.button("生成信号", key="sl_run"):
         try:
             gw = DataGateway()
@@ -657,7 +675,7 @@ def page_strategies():
                 return
             sig = reg_get_strategy(strat).generate_signals(df)
             res = vectorized_backtest(df, sig)
-            st.plotly_chart(equity_chart(res["equity"], f"{symbol} · {strat}"))
+            st.plotly_chart(equity_chart(res["equity"], f"{symbol} · {STRATEGY_CN.get(strat, strat)}"))
             m = res["metrics"]
             cc1, cc2, cc3, cc4 = st.columns(4)
             eq_first = res["equity"].iloc[0]
@@ -859,8 +877,148 @@ def page_capabilities():
         st.write("**数据源**：", cap["data"])
         st.write("**执行能力**：", cap["execution"])
     st.subheader("策略 / 优化器（注册表驱动，自动发现）")
-    st.write("**策略**：", STRATEGY_NAMES)
+    st.write("**策略**：", [STRATEGY_CN.get(n, n) for n in STRATEGY_NAMES])
     st.write("**优化器**：", OPTIMIZER_NAMES)
+
+
+# ---------------- 实时行情（K 线查看，全资产） ----------------
+def page_quote():
+    """各资产（股票/基金/期货/期权）实时 K 线行情查看。
+
+    用户选资产类别 + 输入代码，经 DataGateway 取 OHLCV（真实优先、离线降级演示），
+    用 Plotly 蜡烛图展示，红涨绿跌；并给出行情概览指标与数据来源提示。
+    """
+    st.header("📉 实时行情 · K 线查看")
+    st.caption("覆盖股票 / 基金 / 期货 / 期权四类资产；真实行情优先，断网或 unavailable 时自动降级为演示数据并明确提示。")
+
+    asset = st.radio("资产类别", list(ASSET_LABELS.keys()),
+                     format_func=lambda a: ASSET_LABELS[a], horizontal=True, key="q_asset")
+    default_sym = {
+        "stock": "600519.SH", "fund": "510300.SH", "future": "IF.CFE", "option": "100000001.SH",
+    }[asset]
+
+    # 拼音首字母搜索（如 hmd → 黑牡丹 / 恒铭达 / 宏明电子）
+    st.caption("💡 支持「代码 / 中文名 / 拼音首字母」搜索，点击候选项自动填入下方「标的代码」")
+    if "q_search_results" not in st.session_state:
+        st.session_state.q_search_results = []
+    if "q_sym" not in st.session_state:
+        st.session_state.q_sym = default_sym
+
+    def _on_search_change():
+        q = st.session_state.get("q_search", "").strip()
+        st.session_state.q_search_results = search_symbols(q, asset=asset, top_k=8) if q else []
+
+    st.text_input("🔍 标的搜索", "", key="q_search",
+                  placeholder="如 hmd、茅台、600519", on_change=_on_search_change)
+
+    results = st.session_state.q_search_results
+
+    def _on_pick(symbol):
+        """点击候选标的后：回填代码、清空结果与搜索框（在 button 回调里修改 q_search，
+        避免在 widget 实例化后再赋值触发 StreamlitAPIException）。"""
+        st.session_state.q_sym = symbol
+        st.session_state.q_search_results = []
+        st.session_state.q_search = ""
+
+    if results:
+        st.markdown(f"**匹配结果（{len(results)} 条）**")
+        cols = st.columns(min(len(results), 4))
+        for i, r in enumerate(results):
+            tag = f" {' · '.join(r['tags'][:2])}" if r.get("tags") else ""
+            btn_text = f"{r['name']} {r['symbol'].split('.')[0]}{tag}"
+            with cols[i % 4]:
+                st.button(btn_text, key=f"q_pick_{i}", use_container_width=True,
+                          help=f"拼音首字母：{r['initials'] or '-'}",
+                          on_click=_on_pick, args=(r["symbol"],))
+    elif st.session_state.get("q_search", "").strip():
+        st.info("未找到匹配标的。离线时仅覆盖内置标的；联网后会自动扩展全市场 A 股 / ETF。")
+
+    sym = st.text_input("标的代码", st.session_state.q_sym, key="q_sym")
+    col1, col2 = st.columns(2)
+    with col1:
+        lookback_days = st.slider("回看交易日", 20, 250, 120, key="q_days")
+    with col2:
+        chart_kind = st.selectbox("图表类型", ["蜡烛图", "收盘价线"], key="q_kind")
+    if st.button("▶ 拉取行情", key="q_run"):
+        try:
+            gw = DataGateway()
+            end = datetime.date.today()
+            start = end - datetime.timedelta(days=int(lookback_days) * 2 + 30)
+            df, warn = gw_fetch(gw, sym, str(start), str(end), asset=AssetType(asset))
+            if warn:
+                st.warning(warn)
+            if df is None or df.empty:
+                st.error("无行情数据（离线降级也未生成，请检查代码/网络）。")
+                return
+            df = df.sort_values("date").tail(int(lookback_days))
+            is_option = (asset == "option")
+            if is_option:
+                # 期权无传统 OHLC K 线：展示期权价格走势 + 关键 Greeks 概要
+                last = float(df["option_price"].iloc[-1])
+                prev = float(df["option_price"].iloc[-2]) if len(df) > 1 else last
+                chg = (last / prev - 1) if prev else 0.0
+                o, h, l, c = st.columns(4)
+                o.metric("最新期权价", f"{last:.4f}")
+                h.metric("涨跌幅", f"{chg*100:+.2f}%", delta=f"{chg*100:+.2f}%",
+                         delta_color="inverse")
+                l.metric("Delta", f"{float(df['delta'].iloc[-1]):.3f}")
+                c.metric("隐含波动率(vega)", f"{float(df['vega'].iloc[-1]):.4f}")
+                st.caption(f"标的：{df['underlying'].iloc[-1]}　|　行权价：{df['strike'].iloc[-1]}　|　"
+                           f"类型：{df['type'].iloc[-1]}　|　到期：{df['expiry'].iloc[-1]}　|　"
+                           f"数据行数：{len(df)}")
+                fig = go.Figure(data=[go.Scatter(
+                    x=df["date"], y=df["option_price"], mode="lines",
+                    line=dict(color=ACCENT), name="期权价格")])
+                fig.update_layout(yaxis_title="期权价格", xaxis_title="日期",
+                                  template="plotly_dark", height=480,
+                                  margin=dict(l=20, r=20, t=30, b=20),
+                                  title=f"{sym} · {get_symbol_name(sym, asset)} · 期权行情(价格+Greeks)")
+                st.plotly_chart(fig, use_container_width=True)
+                greeks = df[["date", "option_price", "delta", "gamma", "vega", "theta", "rho"]].copy()
+                greeks["date"] = greeks["date"].astype(str)
+                st.dataframe(greeks, use_container_width=True)
+            else:
+                # 股票/基金/期货：标准 OHLC 蜡烛图，红涨绿跌
+                last = float(df["close"].iloc[-1])
+                prev = float(df["close"].iloc[-2]) if len(df) > 1 else last
+                chg = (last / prev - 1) if prev else 0.0
+                hi = float(df["high"].max())
+                lo = float(df["low"].min())
+                vol = float(df["volume"].sum())
+                o, h, l, c = st.columns(4)
+                o.metric("最新收盘", f"{last:.2f}")
+                h.metric("涨跌幅", f"{chg*100:+.2f}%", delta=f"{chg*100:+.2f}%",
+                         delta_color="inverse")  # 红涨绿跌由颜色另行处理
+                l.metric("区间最高", f"{hi:.2f}")
+                c.metric("区间最低", f"{lo:.2f}")
+                st.caption(f"累计成交量：{vol:,.0f}　|　最近交易日：{df['date'].iloc[-1].date()}　|　数据行数：{len(df)}")
+
+                if chart_kind == "蜡烛图":
+                    fig = go.Figure(data=[go.Candlestick(
+                        x=df["date"],
+                        open=df["open"], high=df["high"], low=df["low"], close=df["close"],
+                        increasing=dict(line=dict(color=RED), fillcolor=RED),
+                        decreasing=dict(line=dict(color=GREEN), fillcolor=GREEN),
+                        name="K线",
+                    )])
+                    fig.update_layout(yaxis_title="价格", xaxis_title="日期")
+                else:
+                    fig = go.Figure(data=[go.Scatter(
+                        x=df["date"], y=df["close"], mode="lines",
+                        line=dict(color=ACCENT), name="收盘")])
+                    fig.update_layout(yaxis_title="收盘价", xaxis_title="日期")
+                fig.update_layout(template="plotly_dark", height=480,
+                                  margin=dict(l=20, r=20, t=30, b=20),
+                                  title=f"{sym} · {get_symbol_name(sym, asset)} · {ASSET_LABELS[asset]}")
+                # 红涨绿跌：上涨 K 线用红、下跌用绿（已在 Candlestick 中设定）
+                st.plotly_chart(fig, use_container_width=True)
+
+                with st.expander("查看 OHLCV 明细"):
+                    show = df.copy()
+                    show["date"] = show["date"].astype(str)
+                    st.dataframe(show, use_container_width=True)
+        except Exception as e:
+            st.error(f"行情拉取失败：{e}")
 
 
 # ---------------- 路由 ----------------
@@ -877,7 +1035,7 @@ def page_live():
     st.caption("把策略信号经盘前风控后路由到 broker；paper=模拟成交，qmt/pt=真实柜台（需 SDK+账户）。")
 
     broker_kind = st.selectbox("Broker 类型", ["paper", "sim", "qmt", "pt"])
-    strategy = st.selectbox("策略", STRATEGY_NAMES)
+    strategy = strategy_selectbox("策略", STRATEGY_NAMES)
     symbols = st.text_input("标的（逗号分隔）", "600519.SH,000300.SH")
     _syms = [s.strip() for s in symbols.split(",") if s.strip()]
     if _syms:
@@ -1073,5 +1231,6 @@ PAGES = {
         "能力总览": page_capabilities,
         "实盘交易": page_live,
         "多账户与定时": page_multi,
+        "实时行情": page_quote,
     }
 PAGES[PAGE]()
