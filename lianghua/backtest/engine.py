@@ -10,6 +10,14 @@ v2 改进：
 - _buy 资金约束保证 cost <= cash，且不再记录零股交易。
 - BacktestResult 新增 stats()：总收益、交易次数、最大回撤等可观测指标。
 - to_frame / stats 对缺列、空序列更稳健。
+
+v3 改进（前视偏差 / look-ahead bias 治理）：
+- 信号默认**延迟一期执行**（execution_lag=1）。此前信号与成交同处一根 K 线：
+  策略用 t 日收盘价算出信号，引擎又用 t 日收盘价成交——实盘中 t 收盘价只有
+  收盘那一刻才知道，无法据此成交，回测收益因此虚高。
+- 成交价默认取**次日开盘价**（fill_price="open"，缺 open 列时自动回退收盘价），
+  进一步贴近实盘；估值（equity）仍按收盘价计算。
+- 保留 execution_lag=0 供研究对照，但会在 stats() 中标 look_ahead=True 警示。
 """
 from __future__ import annotations
 
@@ -26,12 +34,18 @@ _LOT = 100
 class BacktestResult:
     """回测结果容器。"""
 
-    def __init__(self, equity: pd.Series, trades: list[dict], signals: pd.Series, df: pd.DataFrame, skipped: int = 0):
+    def __init__(self, equity: pd.Series, trades: list[dict], signals: pd.Series, df: pd.DataFrame,
+                 skipped: int = 0, exec_signals: pd.Series | None = None,
+                 execution_lag: int = 1, fill_price: str = "open"):
         self.equity = equity
         self.trades = trades
         self.signals = signals
         self.df = df
         self.skipped = skipped
+        # 实际用于下单的信号（已延迟 execution_lag 期），与原始 signals 分开放，便于审计
+        self.exec_signals = exec_signals if exec_signals is not None else signals
+        self.execution_lag = execution_lag
+        self.fill_price = fill_price
 
     def to_frame(self) -> pd.DataFrame:
         out = pd.DataFrame(index=self.equity.index)
@@ -66,6 +80,10 @@ class BacktestResult:
             "n_trades": len(self.trades),
             "max_drawdown": md,
             "final_equity": end,
+            # 可审计：结果是否建立在可执行假设上
+            "execution_lag": self.execution_lag,
+            "fill_price": self.fill_price,
+            "look_ahead": self.execution_lag == 0,
         }
 
 
@@ -80,6 +98,8 @@ class BacktestEngine:
         tax: float = 0.001,           # 千一印花税（卖出）
         risk: RiskManager | None = None,
         cost: "CostModel | None" = None,
+        execution_lag: int = 1,       # 信号延迟 N 期执行（1=次日，杜绝前视偏差）
+        fill_price: str = "open",     # 成交价基准：open（实盘）| close（研究对照）
     ):
         self.init_cash = init_cash
         self.commission = commission
@@ -87,6 +107,12 @@ class BacktestEngine:
         self.tax = tax
         self.risk = risk or RiskManager()
         self.cost = cost
+        # 前视偏差护栏：lag 必须非负整数；fill_price 非法值回退 open
+        try:
+            self.execution_lag = max(0, int(execution_lag))
+        except (TypeError, ValueError):
+            self.execution_lag = 1
+        self.fill_price = fill_price if fill_price in ("open", "close") else "open"
         self.trades: list[dict] = []
 
     # ---------- 报价（成交价 + 费用 + 税），杜绝滑点重复计入 ----------
@@ -109,6 +135,17 @@ class BacktestEngine:
                 fee = abs(fill * qty) * self.commission
                 tax = abs(fill * qty) * self.tax
         return fill, fee, tax
+
+    # ---------- 成交价（实盘用开盘，缺 open 列时回退收盘） ----------
+    def _trade_price(self, row, close_px: float) -> float:
+        if self.fill_price == "open":
+            try:
+                o = float(row["open"]) if "open" in row.index else float("nan")
+            except (TypeError, ValueError):
+                o = float("nan")
+            if np.isfinite(o) and o > 0:
+                return o
+        return close_px
 
     # ---------- 撮合 ----------
     def _buy(self, price: float, qty: int, cash: float, date):
@@ -167,6 +204,9 @@ class BacktestEngine:
             sig = sig.fillna(0)
         else:
             sig = pd.Series(0, index=df.index)
+        # 前视偏差治理：信号延迟 execution_lag 期后再执行。
+        # lag=0 表示「当日收盘出信号、当日收盘价成交」——实盘不可执行，仅供研究对照。
+        exec_sig = sig.shift(self.execution_lag).fillna(0) if self.execution_lag else sig
         for i, row in df.iterrows():
             dt = row["date"] if has_date else df.index[pos]
             try:
@@ -183,28 +223,30 @@ class BacktestEngine:
                 pos += 1
                 continue
             last_price = price
-            s = int(sig.iloc[pos])
+            s = int(exec_sig.iloc[pos])
+            # 成交价：信号已于 execution_lag 期前产生，用当前 bar 的开盘价成交（实盘可执行）
+            tpx = self._trade_price(row, price)
 
-            # 持仓中断损
+            # 持仓中断损（按收盘价判定，按成交价卖出）
             if shares > 0 and self.risk.check_exit(entry_price, price):
-                cash, shares, trade = self._sell(price, shares, cash, dt, "stop_loss")
+                cash, shares, trade = self._sell(tpx, shares, cash, dt, "stop_loss")
                 self._log(trade)
                 entry_price = 0.0
 
             # 买入信号
             if s == 1 and shares == 0:
-                size = self.risk.position_size(cash, price)
+                size = self.risk.position_size(cash, tpx)
                 budget = cash * size
-                qty = int(budget / (price * (1 + self.slippage + self.commission)) // _LOT) * _LOT
+                qty = int(budget / (tpx * (1 + self.slippage + self.commission)) // _LOT) * _LOT
                 if qty > 0 and self.risk.check_entry(str(row.get("symbol", "")), cash):
-                    cash, shares, trade = self._buy(price, qty, cash, dt)
+                    cash, shares, trade = self._buy(tpx, qty, cash, dt)
                     if trade is not None:
                         self._log(trade)
-                        entry_price = price
+                        entry_price = tpx
 
             # 卖出信号
             elif s == -1 and shares > 0:
-                cash, shares, trade = self._sell(price, shares, cash, dt, "signal")
+                cash, shares, trade = self._sell(tpx, shares, cash, dt, "signal")
                 self._log(trade)
                 entry_price = 0.0
 
@@ -213,7 +255,9 @@ class BacktestEngine:
             pos += 1
 
         eq = pd.Series(equity, index=pd.to_datetime(dates), name="equity")
-        return BacktestResult(eq, self.trades, sig, df, skipped=skipped)
+        return BacktestResult(eq, self.trades, sig, df, skipped=skipped,
+                              exec_signals=exec_sig, execution_lag=self.execution_lag,
+                              fill_price=self.fill_price)
 
     def _log(self, trade: dict):
         self.trades.append(trade)

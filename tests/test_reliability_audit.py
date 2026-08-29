@@ -28,6 +28,7 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 from lianghua.strategy.registry import STRATEGY_NAMES, get_strategy
 from lianghua.portfolio.registry import OPTIMIZER_NAMES, optimize_weights
+from lianghua.backtest.engine import BacktestEngine
 
 
 # ------------------------------------------------------------------  fixtures
@@ -334,6 +335,95 @@ def test_quant_function_no_crash_no_nan(fqn):
         f"{fqn} 无法用自动派发的输入形态驱动（签名特殊，需人工核对）: "
         f"{type(last_exc).__name__}: {last_exc}"
     )
+
+
+# ------------------------------------------------------------------  前视偏差（look-ahead bias）
+def _random_walk(n: int = 600, seed: int = 7):
+    """无动量、无漂移的随机游走：任何"超额"收益都只能来自前视或运气。"""
+    rng = np.random.default_rng(seed)
+    close = 100 * np.cumprod(1 + rng.normal(0, 0.015, n))
+    # 开盘价 = 前收 + 小幅跳空，保证 open 列存在且可用
+    prev = np.concatenate([[close[0]], close[:-1]])
+    gap = rng.normal(0, 0.002, n)
+    open_ = prev * (1 + gap)
+    noise = np.abs(rng.normal(0, np.std(close) * 0.3 + 0.01, n))
+    idx = pd.date_range("2021-01-04", periods=n, freq="B")
+    return pd.DataFrame(
+        {"open": open_, "high": close + noise, "low": close - noise,
+         "close": close, "volume": np.abs(rng.normal(1e6, 3e5, n)) + 1e4},
+        index=idx,
+    )
+
+
+def _cheat_signals(df: pd.DataFrame) -> pd.Series:
+    """作弊策略（仅用于审计）：用**当日收盘**相对昨收的涨跌决定当日信号。
+
+    关键：该信号在当日开盘时**不可得**（close[t] 尚未产生）。
+    因此若引擎用它在当日开盘成交，就是标准的开盘点前视偏差；
+    延迟一期后，它退化为「昨日涨跌」的动量信号，在随机游走（无动量）上无用。
+    """
+    prev_close = df["close"].shift(1)
+    sig = pd.Series(0, index=df.index, dtype=int)
+    sig[df["close"] > prev_close] = 1
+    sig[df["close"] < prev_close] = -1
+    return sig
+
+
+def test_engine_default_is_not_look_ahead():
+    """默认参数必须杜绝前视：延迟一期 + 开盘成交。"""
+    eng = BacktestEngine()
+    assert eng.execution_lag == 1, "默认必须延迟一期执行，否则回测含前视偏差"
+    assert eng.fill_price == "open", "默认应以上帝视角不可得的开盘价成交"
+    res = eng.run(_random_walk(), pd.Series(0, index=_random_walk().index))
+    assert res.stats()["look_ahead"] is False
+
+
+def test_engine_rejects_bad_execution_params():
+    """非法 execution_lag / fill_price 必须回退到安全值，不能让前视悄悄生效。"""
+    assert BacktestEngine(execution_lag=-5).execution_lag == 0
+    assert BacktestEngine(execution_lag="abc").execution_lag == 1
+    assert BacktestEngine(fill_price="next_tuesday").fill_price == "open"
+    assert BacktestEngine(fill_price="close").fill_price == "close"
+
+
+def test_look_ahead_bias_is_neutralized():
+    """黄金测试：开盘时不可得的信号，不得用于开盘成交。
+
+    信号 = sign(close[t] - close[t-1])，在 t 日开盘时 close[t] 尚未产生。
+    - execution_lag=0 + fill_price=open：当日信号当日开盘成交 —— 开盘点前视，
+      每天白赚日内涨幅，收益虚高。
+    - execution_lag=1 + fill_price=open：t 日收盘出信号、t+1 开盘成交，
+      信号退化为「昨日涨跌」动量；随机游走无动量，扣完成本后应接近 0。
+    两者之差即前视偏差带来的虚假收益。
+    """
+    df = _random_walk()
+    cheat = _cheat_signals(df)
+
+    # 开盘点前视：当日信号 + 当日开盘成交（开盘时 close[t] 尚未产生）
+    leak = BacktestEngine(execution_lag=0, fill_price="open").run(df, cheat)
+    # 正确：信号延迟一期，t 日收盘出信号、t+1 开盘成交
+    honest = BacktestEngine(execution_lag=1, fill_price="open").run(df, cheat)
+
+    la = float(leak.stats()["total_return"])
+    ho = float(honest.stats()["total_return"])
+
+    # 1) 前视通道必须真实存在 —— 否则说明这个测试没构造出作弊效果
+    assert la > 0.20, f"作弊策略在前视引擎下应大幅盈利，实际 {la:.2%}（测试本身失效）"
+    # 2) 延迟执行必须把虚假收益抹掉（量级相差至少一个数量级）
+    assert ho < la * 0.2, f"延迟执行后虚假收益未被消除：lag=0 {la:.2%} vs lag=1 {ho:.2%}"
+    # 3) 随机游走无动量可赚，扣完成本后正确版本不应产生可观正收益
+    assert ho < 0.10, f"延迟执行后仍盈利 {ho:.2%}，随机游走无动量可赚，疑似仍有信息泄露"
+
+
+def test_missing_open_column_falls_back_to_close():
+    """缺 open 列时必须自动回退收盘成交，不能崩或静默不交易。"""
+    df = _random_walk().drop(columns=["open"])
+    sig = pd.Series(0, index=df.index)
+    sig.iloc[10] = 1
+    sig.iloc[-1] = -1
+    res = BacktestEngine().run(df, sig)
+    assert len(res.trades) >= 1, "缺 open 列时应回退收盘价并正常成交"
+    assert res.stats()["look_ahead"] is False
 
 
 if __name__ == "__main__":
