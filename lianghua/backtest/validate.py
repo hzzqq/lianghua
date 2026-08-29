@@ -89,7 +89,12 @@ def out_of_sample_report(
 
     if r_in > 0:
         decay = float(1.0 - r_out / r_in)
-        if r_out <= 0:
+        if decay < 0:
+            # 样本外反而更强：不能写成「衰减 -158%」，那样读起来像坏了
+            verdict = "robust"
+            note = (f"样本内 {r_in:.1%} → 样本外 {r_out:.1%}：样本外更强，"
+                    f"稳健性好；但区间差异较大时也可能只是运气，建议换区间复核")
+        elif r_out <= 0:
             verdict = "overfit"
             note = (f"样本内 {r_in:.1%} → 样本外 {r_out:.1%}："
                     f"收益由正转负，典型的过拟合，不建议据此配置资金")
