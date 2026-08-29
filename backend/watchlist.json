@@ -1,0 +1,14 @@
+{
+  "description": "后端启动后主动预热拉取真实行情的标的清单。asset 显式声明以走对的正确真实源（ETF 用 fund 走 fund_etf_hist_em，否则会被误判为股票而降级）。断网时整体自动降级演示数据并如实标注 source=demo。",
+  "warm_days": 90,
+  "items": [
+    {"symbol": "600519.SH", "asset": "stock", "name": "贵州茅台"},
+    {"symbol": "000001.SZ", "asset": "stock", "name": "平安银行"},
+    {"symbol": "300750.SZ", "asset": "stock", "name": "宁德时代"},
+    {"symbol": "510300.SH", "asset": "fund",  "name": "沪深300ETF"},
+    {"symbol": "510500.SH", "asset": "fund",  "name": "中证500ETF"},
+    {"symbol": "510050.SH", "asset": "fund",  "name": "上证50ETF"},
+    {"symbol": "RU.SHF",    "asset": "future","name": "橡胶主连"},
+    {"symbol": "AG.SHF",    "asset": "future","name": "白银主连"}
+  ]
+}
