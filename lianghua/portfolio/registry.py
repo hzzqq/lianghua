@@ -29,7 +29,7 @@ from .advanced import (
     max_sharpe, min_cvar, shrinkage_min_var, max_entropy, momentum_score,
     min_tail_risk, vol_target_opt,
     bayesian_shrinkage, max_return, min_track_error, robust_cov,
-    sanitize_weights,
+    sanitize_weights, _finalize,
 )
 
 
@@ -144,13 +144,17 @@ def get_optimizer(name: str, **kwargs):
 
     def _caller(returns: pd.DataFrame, **kw):
         kw.update(kwargs)
+        idx = returns.columns
         try:
             w = fn(returns, **kw)
-            return sanitize_weights(w, returns.columns)
+            # 用 _finalize 而非 sanitize_weights：后者返回裸 ndarray，
+            # 而本注册表的契约是「返回带资产索引的 weight Series」，
+            # 丢掉索引会让下游按列名取权重的代码全部失效。
+            return _finalize(w, idx)
         except Exception:  # noqa: BLE001
             # 任何内部异常（如协方差不可逆）都降级为等权，保证可下单
-            n = len(returns.columns)
-            return pd.Series(np.ones(n) / n, index=returns.columns)
+            n = len(idx)
+            return pd.Series(np.ones(n) / n, index=idx)
 
     return _caller
 

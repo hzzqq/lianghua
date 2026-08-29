@@ -15,7 +15,12 @@ def _df(prices, symbol="X"):
 
 def test_run_basic_produces_equity_and_trades():
     prices = [100, 101, 102, 103, 104, 103, 102, 101, 100, 99]
-    sig = pd.Series([1] + [0] * 8 + [-1], index=pd.date_range("2023-01-01", periods=10, freq="D"))
+    # 末位留 0：默认 execution_lag=1 会把每个信号推迟一根 K 线执行，
+    # 因此最后 lag 个信号会被推到回测区间之外而不成交（这是正确语义，
+    # 见 test_trailing_signal_deferred_out_of_range）。要让卖出指令在区间内
+    # 真正执行，信号序列末尾必须留出 lag 根 K 线。
+    sig = pd.Series([1] + [0] * 7 + [-1, 0],
+                    index=pd.date_range("2023-01-01", periods=10, freq="D"))
     df = _df(prices)
     eng = BacktestEngine(init_cash=1_000_000)
     res = eng.run(df, sig)
@@ -24,6 +29,36 @@ def test_run_basic_produces_equity_and_trades():
     assert any(t["side"] == "SELL" for t in res.trades)
     st = res.stats()
     assert set(st) >= {"total_return", "n_trades", "max_drawdown", "final_equity"}
+
+
+def test_trailing_signal_deferred_out_of_range():
+    """延迟执行的固有语义：末尾 lag 个信号不会在区间内成交。
+
+    这不是缺陷——信号产生于 t 日收盘，只能在 t+1 及之后执行；若回测
+    到 t 日为止，t 日产生的信号就落在区间之外。反过来若强行执行它，
+    就等于假设能在信号产生的同一刻成交，即重新引入前视偏差。
+    """
+    prices = [100, 101, 102, 103, 104]
+    idx = pd.date_range("2023-01-01", periods=5, freq="D")
+    sig = pd.Series([0, 0, 0, 0, 1], index=idx)  # 最后一根才出买入信号
+    df = _df(prices)
+    res = BacktestEngine().run(df, sig)
+    assert res.trades == [], "末位信号应被延迟到区间外，不得在区间内成交"
+    # 对照：lag=0 时同一信号会在区间内成交（研究用途，非实盘假设）
+    res0 = BacktestEngine(execution_lag=0).run(df, sig)
+    assert any(t["side"] == "BUY" for t in res0.trades)
+
+
+def test_last_signal_lost_warning_is_observable():
+    """末尾 N 个信号被延迟出区间时，结果里必须可查证，不能静默。"""
+    prices = [100, 101, 102, 103, 104]
+    idx = pd.date_range("2023-01-01", periods=5, freq="D")
+    sig = pd.Series([1, 0, 0, 0, -1], index=idx)
+    res = BacktestEngine().run(_df(prices), sig)
+    # exec_signals 暴露实际下单用的信号，用户可比对自己给的 signals
+    assert res.exec_signals is not None
+    assert float(res.exec_signals.iloc[-1]) == 0.0
+    assert res.stats()["execution_lag"] == 1
 
 
 def test_no_overspend_cash_never_negative():
