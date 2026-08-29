@@ -28,7 +28,7 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 from lianghua.strategy.registry import STRATEGY_NAMES, get_strategy
 from lianghua.portfolio.registry import OPTIMIZER_NAMES, optimize_weights
-from lianghua.backtest.engine import BacktestEngine
+from lianghua.backtest.engine import BacktestEngine, BacktestResult
 
 
 # ------------------------------------------------------------------  fixtures
@@ -517,6 +517,80 @@ def test_indicator_no_look_ahead(fqn):
             )
         return
     pytest.skip(f"{fqn} 无法用自动派发的输入形态驱动，未做前视判定")
+
+
+# ------------------------------------------------------------------  回测结果健全性检查
+def _codes(sanity: dict) -> set:
+    return {i["code"] for i in sanity["issues"]}
+
+
+def test_sanity_flags_look_ahead_result():
+    """前视造成的「完美策略」必须被自动标记，而不是被当成策略能力。"""
+    df = _random_walk()
+    cheat = _cheat_signals(df)
+    res = BacktestEngine(execution_lag=0, fill_price="open").run(df, cheat)
+    sn = res.sanity()
+    codes = _codes(sn)
+    assert "look_ahead" in codes
+    # 前视的伴生特征：夏普畸高、收益极高却几乎无回撤 —— 至少命中其一
+    assert {"high_sharpe", "too_smooth"} & codes, f"未识别前视伴生特征：{sorted(codes)}"
+    assert sn["level"] == "warn"
+
+
+def test_sanity_clean_for_honest_result():
+    """正确执行下，同一作弊策略不应再触发前视类告警。"""
+    df = _random_walk()
+    cheat = _cheat_signals(df)
+    res = BacktestEngine(execution_lag=1, fill_price="open").run(df, cheat)
+    codes = _codes(res.sanity())
+    assert "look_ahead" not in codes
+    assert "high_sharpe" not in codes
+    assert "too_smooth" not in codes
+
+
+def test_sanity_flags_short_sample_and_zero_cost():
+    df = _random_walk().iloc[:30]
+    cheat = _cheat_signals(df)
+    res = BacktestEngine(commission=0.0, slippage=0.0, tax=0.0).run(df, cheat)
+    codes = _codes(res.sanity())
+    assert "short_sample" in codes, "样本 <60 根必须告警"
+    assert "zero_cost" in codes, "零成本必须告警"
+
+
+def test_sanity_flags_flat_signal():
+    """信号全程不变 = 策略没起作用，收益无意义。"""
+    df = _random_walk()
+    flat = pd.Series(0, index=df.index)  # 全程空仓
+    res = BacktestEngine().run(df, flat)
+    codes = _codes(res.sanity())
+    assert "flat_signal" in codes
+
+
+def test_sanity_error_on_bad_equity():
+    """权益曲线含 NaN/inf 属致命问题，必须是 error 级。"""
+    eq = pd.Series([1.0, 2.0, float("nan"), 4.0])
+    res = BacktestResult(eq, [], pd.Series([0, 0, 0, 0]), None)
+    sn = res.sanity()
+    assert sn["level"] == "error"
+    assert "bad_equity" in _codes(sn)
+
+
+def test_sanity_handles_empty_equity():
+    res = BacktestResult(pd.Series([], dtype=float), [], pd.Series([], dtype=float), None)
+    sn = res.sanity()
+    assert sn["ok"] is False and sn["level"] == "error"
+
+
+def test_sanity_result_shape():
+    """sanity 的返回结构必须稳定，UI 才能直接渲染。"""
+    df = _random_walk()
+    res = BacktestEngine().run(df, pd.Series(0, index=df.index))
+    sn = res.sanity()
+    assert set(sn) == {"ok", "level", "issues"}
+    assert sn["level"] in ("ok", "warn", "error")
+    for it in sn["issues"]:
+        assert set(it) == {"level", "code", "msg"}
+        assert it["level"] in ("warn", "error")
 
 
 if __name__ == "__main__":

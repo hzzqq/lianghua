@@ -18,6 +18,11 @@ v3 改进（前视偏差 / look-ahead bias 治理）：
 - 成交价默认取**次日开盘价**（fill_price="open"，缺 open 列时自动回退收盘价），
   进一步贴近实盘；估值（equity）仍按收盘价计算。
 - 保留 execution_lag=0 供研究对照，但会在 stats() 中标 look_ahead=True 警示。
+
+v4 改进（结果可信度）：
+- BacktestResult.sanity()：把「看起来太美」的结果自动标记出来（样本过短、
+  交易过少、零成本、夏普 >3、高收益零回撤、前视执行假设），避免把过拟合
+  或前视造成的虚高收益当成策略能力。
 """
 from __future__ import annotations
 
@@ -36,7 +41,9 @@ class BacktestResult:
 
     def __init__(self, equity: pd.Series, trades: list[dict], signals: pd.Series, df: pd.DataFrame,
                  skipped: int = 0, exec_signals: pd.Series | None = None,
-                 execution_lag: int = 1, fill_price: str = "open"):
+                 execution_lag: int = 1, fill_price: str = "open",
+                 commission: float = 0.0003, slippage: float = 0.001,
+                 tax: float = 0.001, cost_model: bool = False):
         self.equity = equity
         self.trades = trades
         self.signals = signals
@@ -46,6 +53,10 @@ class BacktestResult:
         self.exec_signals = exec_signals if exec_signals is not None else signals
         self.execution_lag = execution_lag
         self.fill_price = fill_price
+        self.commission = commission
+        self.slippage = slippage
+        self.tax = tax
+        self.cost_model = cost_model
 
     def to_frame(self) -> pd.DataFrame:
         out = pd.DataFrame(index=self.equity.index)
@@ -85,6 +96,92 @@ class BacktestResult:
             "fill_price": self.fill_price,
             "look_ahead": self.execution_lag == 0,
         }
+
+    def sanity(self) -> dict:
+        """回测结果健全性检查：把「看起来太美」的结果自动标记出来。
+
+        回测跑通不等于结果可信。常见不可信信号：样本太短、交易太少、零成本、
+        夏普高到不合常理、收益极高却几乎没有回撤、前视执行假设。本方法把这些
+        做成可断言的规则，供 UI/CLI 直接展示，避免把过拟合或前视造成的虚高
+        收益当成策略能力。
+
+        返回 ``{"ok": bool, "level": "ok"|"warn"|"error", "issues": [...]}``，
+        issues 每项含 ``level`` / ``code`` / ``msg``。
+        """
+        issues: list[dict] = []
+
+        def add(level: str, code: str, msg: str):
+            issues.append({"level": level, "code": code, "msg": msg})
+
+        eq = self.equity
+        if eq is None or len(eq) < 2:
+            return {"ok": False, "level": "error",
+                    "issues": [{"level": "error", "code": "empty", "msg": "权益序列为空"}]}
+
+        n = len(eq)
+
+        # 权益本身不可算（NaN/inf）是最严重的问题
+        if not np.isfinite(eq.to_numpy(dtype=float, na_value=np.nan)).all():
+            add("error", "bad_equity", "权益曲线含 NaN/inf，回测结果不可用")
+
+        # 1) 样本长度：少于 60 个交易日，任何统计量都不可靠
+        if n < 60:
+            add("warn", "short_sample", f"样本仅 {n} 根 K 线（<60），统计结论不可靠")
+
+        # 2) 交易次数：太少则结果由少数几笔偶然交易决定
+        n_trades = len(self.trades)
+        if n_trades < 10:
+            add("warn", "few_trades", f"仅 {n_trades} 笔交易（<10），结果偶然性大")
+
+        # 3) 信号无变化：策略实际没起作用
+        try:
+            sig = self.signals
+            if sig is not None and len(sig) > 0 and sig.nunique(dropna=True) <= 1:
+                add("warn", "flat_signal", "信号全程为同一取值，策略未产生任何调仓意图")
+        except Exception:  # noqa: BLE001
+            pass
+
+        # 4) 零成本：收益必然虚高，尤其对高频策略
+        zero_cost = (not self.cost_model
+                     and self.commission <= 0 and self.slippage <= 0 and self.tax <= 0)
+        if zero_cost:
+            add("warn", "zero_cost", "佣金/滑点/印花税全为 0，收益虚高（尤其高频策略）")
+
+        # 5) 前视执行假设
+        if self.execution_lag == 0:
+            add("warn", "look_ahead", "信号与成交同日（execution_lag=0），回测含前视偏差收益")
+
+        # 6) 夏普高到不合常理（实盘长期夏普 >3 极罕见）
+        try:
+            from ..perf.metrics import sharpe as _sharpe
+            sr = float(_sharpe(eq))
+        except Exception:  # noqa: BLE001
+            sr = float("nan")
+        if np.isfinite(sr) and sr > 3.0:
+            add("warn", "high_sharpe", f"夏普比率 {sr:.2f} > 3，实盘罕见，疑为过拟合或前视")
+
+        # 7) 高收益却几乎无回撤 —— 典型的「完美策略」假象
+        st = self.stats()
+        md = abs(float(st.get("max_drawdown") or 0.0))
+        tr = float(st.get("total_return") or 0.0)
+        if tr > 0.5 and md < 0.02:
+            add("warn", "too_smooth",
+                f"总收益 {tr:.1%} 但最大回撤仅 {md:.2%}，走势过于平滑，疑似前视或数据异常")
+
+        # 8) 年化收益高到不合常理
+        if n >= 60 and np.isfinite(eq.iloc[-1]) and float(eq.iloc[0]) > 0:
+            years = n / 252.0
+            if years > 0:
+                try:
+                    ann = (float(eq.iloc[-1]) / float(eq.iloc[0])) ** (1.0 / years) - 1.0
+                except (ZeroDivisionError, OverflowError, ValueError):
+                    ann = float("nan")
+                if np.isfinite(ann) and ann > 1.0:
+                    add("warn", "high_annual", f"年化收益 {ann:.0%} > 100%，需复核假设")
+
+        level = "error" if any(i["level"] == "error" for i in issues) else (
+            "warn" if issues else "ok")
+        return {"ok": not issues, "level": level, "issues": issues}
 
 
 class BacktestEngine:
@@ -257,7 +354,9 @@ class BacktestEngine:
         eq = pd.Series(equity, index=pd.to_datetime(dates), name="equity")
         return BacktestResult(eq, self.trades, sig, df, skipped=skipped,
                               exec_signals=exec_sig, execution_lag=self.execution_lag,
-                              fill_price=self.fill_price)
+                              fill_price=self.fill_price, commission=self.commission,
+                              slippage=self.slippage, tax=self.tax,
+                              cost_model=self.cost is not None)
 
     def _log(self, trade: dict):
         self.trades.append(trade)
