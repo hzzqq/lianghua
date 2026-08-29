@@ -12,6 +12,11 @@ import tempfile
 import datetime
 from pathlib import Path
 
+import os
+import json
+import time
+import urllib.parse
+
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
@@ -59,6 +64,7 @@ from lianghua.factor.layer import ic_series
 from lianghua.core.constants import ACCENT, COLOR_UP, COLOR_DOWN
 from lianghua.indicators import INDICATOR_FUNCS
 from lianghua.ui.widgets import safe_pct, safe_num, empty_figure
+from lianghua.ui import theme
 from lianghua.core.capabilities import list_capabilities, summary_counts
 from lianghua.option.strategy import (OPTION_COMBO_REGISTRY, get_option_combo, payoff_curve)
 from lianghua.data.sources import list_sources, fetch_from, last_error
@@ -106,6 +112,271 @@ def gw_fetch(gw, symbol, start, end, asset=None, **kw):
     return df, warn
 
 
+# ---------------- 真实行情后端（HTTP API）接入 ----------------
+# 让终端「实时行情」页优先走独立部署的行情后端（backend/data_server.py），
+# 后端不可用时自动回退到内置 DataGateway，保证离线也能看演示数据。
+DATA_BACKEND_BASE = os.environ.get("LIANGHUA_DATA_BACKEND", "http://127.0.0.1:8600")
+
+
+# 后端存活探测结果缓存（30s TTL），避免每次重渲染都打 2s 网络；
+# 用模块级 dict 而非 st.cache_data，兼容无头测试桩（桩无 cache_data）。
+_BACKEND_PROBE = {"ok": None, "ts": 0.0}
+
+
+def _raw_http_get(url, timeout=5, stream_seconds=0, headers_only=False):
+    """最小 HTTP/1.1 客户端（基于 stdlib socket，绕过 urllib 的代理/沙箱限制）。
+
+    用于访问本地真实行情后端。返回 (status:int, headers:dict, body:str)。
+    - stream_seconds>0：持续读取该秒数内的文本（SSE 用），直到超时或连接关闭；
+    - headers_only=True：读完响应头即返回（用于能力探测，避免阻塞在 SSE 长连接）。
+    任何异常向上抛出，由调用方决定降级。
+    """
+    from urllib.parse import urlparse
+    import socket
+    p = urlparse(url)
+    host = p.hostname or "127.0.0.1"
+    # 沙箱内 socket 直连 "localhost" 走 DNS 解析会偶发卡顿/超时（127.0.0.1 直连则瞬时），
+    # 统一归一化，避免终端↔后端探针因主机名解析抖动而误判离线/取数空。
+    if host in ("localhost",):
+        host = "127.0.0.1"
+    port = p.port or (443 if p.scheme == "https" else 80)
+    path = p.path or "/"
+    if p.query:
+        path += "?" + p.query
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(max(timeout, stream_seconds + 2) if stream_seconds > 0 else timeout)
+    try:
+        sock.connect((host, port))
+        req = (f"GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\n"
+                f"Accept: */*\r\n"
+                f"Connection: {'keep-alive' if stream_seconds > 0 else 'close'}\r\n\r\n")
+        sock.sendall(req.encode("utf-8"))
+        buf = b""
+        while b"\r\n\r\n" not in buf:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            buf += chunk
+        header_blob, _, rest = buf.partition(b"\r\n\r\n")
+        _parts = header_blob.split(b"\r\n")
+        status = 0
+        if _parts and _parts[0]:
+            try:
+                status = int(_parts[0].split(b" ", 2)[1])
+            except (IndexError, ValueError):
+                status = 0
+        headers = {}
+        for _line in _parts[1:]:
+            if b":" in _line:
+                _k, _, _v = _line.partition(b":")
+                headers[_k.decode("utf-8", "replace").strip().lower()] = \
+                    _v.decode("utf-8", "replace").strip()
+        if headers_only:
+            return status, headers, ""
+        body = rest
+        _cl = 0
+        try:
+            _cl = int(headers.get("content-length", "0") or 0)
+        except ValueError:
+            _cl = 0
+        if stream_seconds > 0:
+            # SSE：按秒级窗口持续读取推送帧，直到超时或连接关闭
+            deadline = time.time() + stream_seconds
+            while time.time() < deadline:
+                try:
+                    chunk = sock.recv(4096)
+                except socket.timeout:
+                    break
+                if not chunk:
+                    break
+                body += chunk
+        elif _cl > 0:
+            # 有 Content-Length：精确读取指定字节数即止，不依赖连接关闭
+            # （避免服务端保持 keep-alive 时长连接导致 recv 阻塞到超时）
+            while len(body) < _cl:
+                try:
+                    chunk = sock.recv(min(4096, _cl - len(body)))
+                except socket.timeout:
+                    break
+                if not chunk:
+                    break
+                body += chunk
+        else:
+            # 无 Content-Length（罕见）：读到连接关闭
+            while True:
+                try:
+                    chunk = sock.recv(4096)
+                except socket.timeout:
+                    break
+                if not chunk:
+                    break
+                body += chunk
+        return status, headers, body.decode("utf-8", "replace")
+    finally:
+        try:
+            sock.close()
+        except Exception:
+            pass
+
+
+def _http_get_json(url, timeout=5, default=None):
+    try:
+        _, _, body = _raw_http_get(url, timeout=timeout)
+        return json.loads(body)
+    except Exception:
+        return default
+
+
+def _http_get_status(url, timeout=2):
+    try:
+        return _raw_http_get(url, timeout=timeout, headers_only=True)[0]
+    except Exception:
+        return 0
+
+
+def backend_online() -> bool:
+    """探测真实行情后端是否存活。
+
+    True 缓存 30s（避免频繁打网络）；**False 仅缓存 5s**，
+    这样冷启动/瞬时超时导致的误判能很快自愈，不会把「暂时连不上」锁死 30s。
+    """
+    now = time.time()
+    cached = _BACKEND_PROBE["ok"]
+    if cached is True and (now - _BACKEND_PROBE["ts"]) < 30:
+        return True
+    if cached is False and (now - _BACKEND_PROBE["ts"]) < 5:
+        return False
+    ok = _http_get_status(f"{DATA_BACKEND_BASE}/api/health", timeout=5) == 200
+    _BACKEND_PROBE["ok"] = ok
+    _BACKEND_PROBE["ts"] = now
+    return ok
+
+
+def fetch_history_backend(symbol, start, end, asset=None, timeout=8, force_refresh=False):
+    """优先经真实行情后端 HTTP API 取历史 K 线。
+
+    成功返回 ``(df, warn)``（warn 如实反映 source/demo）；任何异常/空数据
+    返回 ``None``，由调用方回退到内置网关。后端已在 CORS 放开 ``*``，
+    Streamlit 页面内发起浏览器请求也不会被拦。
+    """
+    try:
+        params = {"symbol": symbol, "start": start, "end": end}
+        if asset:
+            a = getattr(asset, "value", asset)  # AssetType 枚举取 .value，字符串原样
+            params["asset"] = str(a).lower()
+        if force_refresh:
+            params["force_refresh"] = "1"
+        url = f"{DATA_BACKEND_BASE}/api/history?" + urllib.parse.urlencode(params)
+        payload = _http_get_json(url, timeout=timeout)
+        if not payload or "error" in payload or not payload.get("data"):
+            return None
+        df = pd.DataFrame(payload["data"])
+        warn = ""
+        if payload.get("was_demo"):
+            warn = ("⚠️ 标的 %s 真实行情获取失败，已自动降级为演示(假)数据；"
+                    "本页结果仅供功能演示，不代表真实行情。" % symbol)
+        elif payload.get("source") == "cache":
+            warn = f"ℹ️ 标的 {symbol} 使用本地缓存的真实行情（source=cache，后端预热落库）。"
+        return df, warn
+    except Exception:
+        return None
+
+
+def fetch_quote_backend(symbol, asset=None, timeout=10):
+    """经真实行情后端 ``/api/quote`` 取实时快照（含涨跌幅）。
+
+    返回含 ``price/preclose/change/pct_change/source/was_demo`` 的 dict；
+    后端不可用或返回 ``source=none``（取不到价）时返回 ``None``，
+    由调用方回退到内置 ``DataGateway.live_quote``。
+    """
+    try:
+        params = {"symbol": symbol}
+        if asset:
+            a = getattr(asset, "value", asset)
+            params["asset"] = str(a).lower()
+        url = f"{DATA_BACKEND_BASE}/api/quote?" + urllib.parse.urlencode(params)
+        payload = _http_get_json(url, timeout=timeout)
+        if not payload or payload.get("source") == "none" or "price" not in payload:
+            return None
+        return payload
+    except Exception:
+        return None
+
+
+def fetch_quote_batch_backend(symbols, timeout=12):
+    """经后端 ``/api/quote_batch`` 批量取实时快照，返回 list[dict]。"""
+    try:
+        url = f"{DATA_BACKEND_BASE}/api/quote_batch?symbols=" + ",".join(symbols)
+        return _http_get_json(url, timeout=timeout) or []
+    except Exception:
+        return []
+
+
+def stream_quotes_snapshot(symbols, seconds: int = 5, interval: float = 2):
+    """从后端 SSE 推送流 ``/api/stream`` 取最近一次批量报价快照（秒级）。
+
+    相比 15s 轮询，SSE 由后端主动推送、秒级刷新；失败时静默回退 None，
+    由调用方退回原有的轮询/单条取数逻辑。绝不因推送失败而中断页面。
+    """
+    if not symbols:
+        return None
+    try:
+        url = (f"{DATA_BACKEND_BASE}/api/stream?interval={interval}"
+               f"&symbols=" + ",".join(symbols))
+        _, _, body = _raw_http_get(url, timeout=seconds + 3, stream_seconds=seconds)
+        _last = None
+        for line in body.splitlines():
+            line = line.strip()
+            if line.startswith("data:"):
+                _payload = line[len("data:"):].strip()
+                try:
+                    _last = json.loads(_payload)
+                except Exception:
+                    _last = None
+        # SSE 帧为 {"event":"quote","ts":...,"data":[...quotes]}，
+        # 这里只取 data 列表，与 fetch_quote_batch_backend 的返回结构对齐。
+        if isinstance(_last, dict) and "data" in _last:
+            return _last["data"]
+        return _last
+    except Exception:
+        return None
+
+
+def backend_supports_sse() -> bool:
+    """探测后端是否支持 SSE 推送（/api/stream 返回 200 且为事件流）。
+
+    结果缓存 60s 到 session_state，避免每次 rerun 都开一条 1s 的长连接。
+    """
+    _cached = st.session_state.get("_sse_supported")
+    if isinstance(_cached, tuple) and (time.time() - _cached[1] < 60):
+        return bool(_cached[0])
+    _ok = False
+    try:
+        _, headers, _ = _raw_http_get(
+            f"{DATA_BACKEND_BASE}/api/stream?symbols=600519.SH&interval=1",
+            timeout=2, headers_only=True)
+        _ok = "text/event-stream" in headers.get("content-type", "")
+    except Exception:
+        _ok = False
+    try:
+        st.session_state["_sse_supported"] = (_ok, time.time())
+    except Exception:
+        pass
+    return _ok
+
+
+def load_watchlist():
+    """读取后端 watchlist.json（标的 + 资产类型 + 中文名）。"""
+    p = ROOT / "backend" / "watchlist.json"
+    if not p.exists():
+        return []
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+        return data.get("items", []) or []
+    except Exception:
+        return []
+
+
 from lianghua.data.gateway import DataGateway
 from lianghua.execution.live import LiveEngine, make_live_engine
 from lianghua.execution.order_book import OrderBook
@@ -121,21 +392,56 @@ ACCENT = "#667eea"
 ASSET_LABELS = {"stock": "股票", "fund": "基金", "future": "期货", "option": "期权"}
 
 st.set_page_config(page_title="Lianghua Quant 多资产终端", page_icon="📈", layout="wide")
-st.title("📈 Lianghua Quant · 多资产量化交易终端")
+theme.inject_theme()
+
+# ---------------- 分组导航 ----------------
+NAV = [
+    ("仪表盘", ["首页"]),
+    ("回测分析", ["单标的回测", "组合·篮子回测", "统一编排(多资产)", "向量化回测",
+                 "蒙特卡洛模拟", "参数优化", "HTML报告"]),
+    ("资产 · 策略", ["期权组合策略", "期货跨期套利", "基金筛选", "策略库",
+                   "组合优化", "因子研究"]),
+    ("实验室", ["指标实验室", "绩效风险分析"]),
+    ("风险", ["风险度量 VaR"]),
+    ("信号 · 执行", ["信号推送", "数据执行能力", "实盘交易", "多账户与定时", "实时行情"]),
+    ("平台", ["能力总览"]),
+]
+CATS = [c for c, _ in NAV]
+PAGES_BY_CAT = {c: ps for c, ps in NAV}
+
+
+def _goto(cat: str, page: str):
+    """首页快捷入口：跳转到指定模块页面（on_click 回调）。"""
+    st.session_state["lh_cat"] = cat
+    st.session_state["lh_page"] = page
+
 
 with st.sidebar:
     if LOGO_PATH.exists():
         st.image(str(LOGO_PATH), width=140)
     st.divider()
-    PAGE = st.radio("功能导航", [
-        "单标的回测", "组合·篮子回测", "统一编排(多资产)",
-        "期权组合策略", "期货跨期套利", "基金筛选",
-        "风险度量 VaR", "向量化回测", "蒙特卡洛模拟",
-        "参数优化", "HTML报告", "信号推送",
-        "策略库", "组合优化", "因子研究",
-        "指标实验室", "绩效风险分析", "数据执行能力", "能力总览",
-        "实盘交易", "多账户与定时", "实时行情",
-    ])
+    _cat_default = st.session_state.get("lh_cat") or "仪表盘"
+    _cat = st.selectbox("模块", CATS,
+                        index=CATS.index(_cat_default) if _cat_default in CATS else 0,
+                        key="lh_cat_sel")
+    _pages = PAGES_BY_CAT[_cat]
+    _page_default = st.session_state.get("lh_page")
+    _idx = _pages.index(_page_default) if _page_default in _pages else 0
+    PAGE = st.radio("页面", _pages, index=_idx, key="lh_page_sel")
+    st.session_state["lh_cat"] = _cat
+    st.session_state["lh_page"] = PAGE
+
+    st.divider()
+    # 全局状态：后端连通 + 版本 + 回首页
+    if backend_online():
+        theme.badge("🟢 行情后端在线", kind="ok")
+    else:
+        theme.badge("🟡 行情后端未连", kind="warn")
+    st.caption("Lianghua Quant · v1.6.0-live")
+    theme.back_to_home()
+
+if PAGE != "首页":
+    st.title("📈 Lianghua Quant · 多资产量化交易终端")
 
 
 # ---------------- 通用辅助 ----------------
@@ -162,25 +468,36 @@ def equity_chart(equity: pd.Series, title: str = "组合净值"):
     eq = pd.Series(equity).astype(float) if equity is not None else pd.Series(dtype=float)
     if len(eq) == 0 or not np.isfinite(eq).any():
         return empty_figure("无有效净值数据")
+    up = eq.iloc[-1] >= eq.iloc[0]
+    color = RED if up else GREEN
+    fill = "rgba(255,77,79,0.12)" if up else "rgba(0,212,134,0.12)"
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=eq.index, y=eq.values, name="净值",
-                             line=dict(color=ACCENT)))
+                             line=dict(color=color, width=2),
+                             fill="tozeroy", fillcolor=fill))
     fig.update_layout(height=420, template="plotly_dark",
                       margin=dict(l=20, r=20, t=30, b=20), title=title)
     return fig
 
 
 def metric_row(m: dict):
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("期末权益", safe_num(m.get("final_equity"), 0))
-    c2.metric("总收益", safe_pct(m.get("total_return")))
-    c3.metric("年化收益", safe_pct(m.get("annual_return")))
-    c4.metric("夏普比率", safe_num(m.get("sharpe")))
-    c5, c6, c7, c8 = st.columns(4)
-    c5.metric("最大回撤", safe_pct(m.get("max_drawdown")))
-    c6.metric("交易次数", int(m.get("num_trades", 0) or 0))
-    c7.metric("胜率", safe_pct(m.get("win_rate")))
-    c8.metric("超额收益", safe_pct(m.get("excess_return")))
+    tr = m.get("total_return") or 0
+    ar = m.get("annual_return") or 0
+    er = m.get("excess_return") or 0
+    items = [
+        {"label": "期末权益", "value": safe_num(m.get("final_equity"), 0)},
+        {"label": "总收益", "value": safe_pct(m.get("total_return")),
+         "color": RED if tr >= 0 else GREEN, "sub": "红涨" if tr >= 0 else "绿跌"},
+        {"label": "年化收益", "value": safe_pct(m.get("annual_return")),
+         "color": RED if ar >= 0 else GREEN},
+        {"label": "夏普比率", "value": safe_num(m.get("sharpe"))},
+        {"label": "最大回撤", "value": safe_pct(m.get("max_drawdown")), "color": GREEN},
+        {"label": "交易次数", "value": int(m.get("num_trades", 0) or 0)},
+        {"label": "胜率", "value": safe_pct(m.get("win_rate"))},
+        {"label": "超额收益", "value": safe_pct(m.get("excess_return")),
+         "color": RED if er >= 0 else GREEN},
+    ]
+    theme.kpi_grid(items, columns=4)
 
 
 # ---------------- 1. 单标的回测 ----------------
@@ -216,14 +533,10 @@ def page_single():
                                risk=RiskManager(stop_loss=stop_loss))
             perf = report(res.equity, res.trades, df=res.df, init_cash=init_cash)
         metric_row(perf)
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(x=res.equity.index, y=res.equity.values,
-                                 name="净值", line=dict(color=ACCENT)))
-        fig.update_layout(height=420, template="plotly_dark",
-                          margin=dict(l=20, r=20, t=20, b=20))
-        st.plotly_chart(fig, use_container_width=True)
+        chart_panel("", equity_chart(res.equity, "组合净值"))
+        theme.badge("📈 回测净值 · 基于历史行情", kind="info")
         if res.trades:
-            st.subheader("成交明细")
+            theme.section_header("成交明细")
             st.dataframe(pd.DataFrame(res.trades), use_container_width=True)
 
 
@@ -253,18 +566,21 @@ def page_basket():
         with st.spinner("回测中..."):
             r = basket_backtest(specs, str(start), str(end), init_cash=init_cash)
         metric_row(r["metrics"])
-        st.plotly_chart(equity_chart(r["equity"], "篮子组合净值"), use_container_width=True)
+        chart_panel("", equity_chart(r["equity"], "篮子组合净值"))
+        theme.badge("📈 回测净值 · 基于历史行情", kind="info")
         col1, col2 = st.columns(2)
         with col1:
-            st.subheader("权重")
-            st.dataframe(pd.DataFrame({"标的": list(r["weights"]),
-                                       "权重": list(r["weights"].values())}),
-                         use_container_width=True)
+            theme.section_header("权重")
+            _wdf = pd.DataFrame({"标的": list(r["weights"]),
+                                 "权重": list(r["weights"].values())})
+            st.dataframe(_wdf, use_container_width=True)
+            theme.csv_export(_wdf, "basket_weights.csv", label="⬇ 导出权重 CSV")
         with col2:
-            st.subheader("收益归因(贡献)")
-            st.dataframe(pd.DataFrame({"标的": list(r["attribution"]),
-                                       "贡献": list(r["attribution"].values())}),
-                         use_container_width=True)
+            theme.section_header("收益归因(贡献)")
+            _adf = pd.DataFrame({"标的": list(r["attribution"]),
+                                 "贡献": list(r["attribution"].values())})
+            st.dataframe(_adf, use_container_width=True)
+            theme.csv_export(_adf, "basket_attribution.csv", label="⬇ 导出归因 CSV")
 
 
 # ---------------- 3. 统一编排(多资产) ----------------
@@ -303,8 +619,9 @@ def page_orchestrator():
         with st.spinner("逐标的回测并合并..."):
             r = run_plan(plan, init_cash=init_cash)
         metric_row(r["metrics"])
-        st.plotly_chart(equity_chart(r["equity"], "组合净值(多资产编排)"), use_container_width=True)
-        st.subheader("成分明细")
+        chart_panel("", equity_chart(r["equity"], "组合净值(多资产编排)"))
+        theme.badge("📈 回测净值 · 基于历史行情", kind="info")
+        theme.section_header("成分明细")
         rows = []
         for sym, c in r["components"].items():
             rows.append({"标的": sym, "资产": c["asset"], "策略": c["strategy"],
@@ -333,21 +650,32 @@ def page_option():
         legs = get_option_combo(combo, **kw)
         pc = payoff_curve(legs, s_lo, s_hi)
         title = f"{combo} · {spec['desc']}"
+        # 到期损益双色填充：盈利区红、亏损区绿（红涨绿跌语义统一）
+        _S = np.asarray(pc["S"], dtype=float)
+        _pnl = np.asarray(pc["pnl"], dtype=float)
+        _pos = np.where(_pnl >= 0, _pnl, 0.0)
+        _neg = np.where(_pnl < 0, _pnl, 0.0)
         fig = go.Figure()
-        fig.add_trace(go.Scatter(x=pc["S"], y=pc["pnl"], name="到期损益",
-                                 line=dict(color=ACCENT), fill="tozeroy"))
+        fig.add_trace(go.Scatter(x=_S, y=_pos, name="盈利区",
+                                 line=dict(color=RED), fill="tozeroy",
+                                 fillcolor="rgba(255,77,79,0.25)"))
+        fig.add_trace(go.Scatter(x=_S, y=_neg, name="亏损区",
+                                 line=dict(color=GREEN), fill="tozeroy",
+                                 fillcolor="rgba(0,212,134,0.25)"))
         fig.add_hline(y=0, line=dict(color="#888", dash="dash"))
         fig.update_layout(height=420, template="plotly_dark", title=title,
                           margin=dict(l=20, r=20, t=30, b=20))
-        st.plotly_chart(fig, use_container_width=True)
+        chart_panel("", fig)
         st.caption(f"最大盈利≈{pc['pnl'].max():.2f}｜最大亏损≈{pc['pnl'].min():.2f}｜"
                    f"盈亏平衡≈{pc.loc[pc['pnl'].abs().idxmin(),'S']:.2f}")
-        st.subheader("组合腿")
-        st.dataframe(pd.DataFrame([{"腿": i + 1, "方向": l.side.upper(),
-                                    "类型": l.otype, "行权价": l.strike,
-                                    "权利金": l.premium}
-                                   for i, l in enumerate(legs)]),
-                     use_container_width=True)
+        theme.badge("📐 模型计算 · 基于输入参数（非行情数据）", kind="info")
+        theme.section_header("组合腿")
+        _legs_df = pd.DataFrame([{"腿": i + 1, "方向": l.side.upper(),
+                                  "类型": l.otype, "行权价": l.strike,
+                                  "权利金": l.premium}
+                                 for i, l in enumerate(legs)])
+        st.dataframe(_legs_df, use_container_width=True)
+        theme.csv_export(_legs_df, f"option_legs_{combo}.csv", label="⬇ 导出组合腿 CSV")
 
 
 # ---------------- 5. 期货跨期套利 ----------------
@@ -388,7 +716,11 @@ def page_future_spread():
         r = fs.run(near_df, far_df)
         metric_row(r["metrics"])
         fig = make_2row(r["spread"], r["equity"], "价差", "净值")
-        st.plotly_chart(fig, use_container_width=True)
+        chart_panel("", fig)
+        if _w and "演示" in _w:
+            theme.source_badge("demo", True)
+        else:
+            theme.source_badge("akshare", False)
         st.caption(f"信号次数={(r['signals'] != 0).sum()}｜交易次数={len(r['trades'])}")
 
 
@@ -424,12 +756,16 @@ def page_fund():
         sc = FundScreener.from_frame(frame)
         res = sc.screen().head(int(topn))
         st.dataframe(res, use_container_width=True)
+        theme.csv_export(res, "fund_screen.csv", label="⬇ 导出筛选结果 CSV")
         fig = go.Figure()
+        # 打分柱按得分高低做梯度着色（低分暗蓝 → 高分强调紫，越亮越好）
         fig.add_trace(go.Bar(x=res.index.astype(str), y=res["综合分"],
-                             marker_color=ACCENT))
+                             marker=dict(color=res["综合分"].astype(float),
+                                         colorscale=[[0, "#5566aa"], [1, "#667eea"]],
+                                         showscale=False)))
         fig.update_layout(height=360, template="plotly_dark", title="综合得分排名",
                           margin=dict(l=20, r=20, t=30, b=20))
-        st.plotly_chart(fig, use_container_width=True)
+        chart_panel("", fig)
 
 
 # ---------------- 7. 风险度量 VaR ----------------
@@ -451,11 +787,20 @@ def page_var():
         rets = res.equity.pct_change().dropna()
         rep = var_report(rets, confs=(0.90, 0.95, 0.99), notional=init_cash)
         st.dataframe(rep, use_container_width=True)
+        _v95 = rep[rep["置信度"] == 0.95].iloc[0]
+        _v99 = rep[rep["置信度"] == 0.99].iloc[0]
+        theme.kpi_grid([
+            {"label": "VaR(95%) 历史", "value": f"{_v95['历史VaR'] * 100:.2f}%", "color": RED},
+            {"label": "CVaR(95%)", "value": f"{_v95['CVaR'] * 100:.2f}%", "color": RED},
+            {"label": "VaR(99%) 历史", "value": f"{_v99['历史VaR'] * 100:.2f}%", "color": RED},
+            {"label": "VaR(99%) 金额", "value": f"{_v99.get('历史VaR金额', 0):,.0f}", "color": RED},
+        ], columns=4)
         fig = go.Figure()
         fig.add_trace(go.Histogram(x=rets.values, nbinsx=60, marker_color=ACCENT))
         fig.update_layout(height=360, template="plotly_dark", title="日收益率分布",
                           margin=dict(l=20, r=20, t=30, b=20))
-        st.plotly_chart(fig, use_container_width=True)
+        chart_panel("", fig)
+        theme.badge("📊 VaR 计算 · 基于回测日收益序列", kind="info")
 
 
 # ---------------- 8. 向量化回测 ----------------
@@ -476,14 +821,16 @@ def page_vectorized():
     if st.button("▶ 运行向量化回测", type="primary", key="vb_run"):
         from lianghua.data.gateway import DataGateway
         gw = DataGateway()
-        df, _w = gw_fetch(gw, symbol, str(start), str(end), asset=AssetType.STOCK)
+        with st.spinner("拉取行情数据..."):
+            df, _w = gw_fetch(gw, symbol, str(start), str(end), asset=AssetType.STOCK)
         if _w: st.warning(_w)
         sig = reg_get_strategy(strategy).generate_signals(df)
         r = vectorized_backtest(df, sig, init_cash=init_cash, cost_rate=cost_rate)
         metric_row(r["metrics"])
         st.metric("换手次数", r["num_changes"])
         fig = make_2row(r["equity"], r["positions"], "净值", "持仓", bar2=False)
-        st.plotly_chart(fig, use_container_width=True)
+        chart_panel("", fig)
+        theme.badge("📈 回测净值 · 基于历史行情", kind="info")
 
 
 # ---------------- 9. 信号推送 ----------------
@@ -505,9 +852,17 @@ def page_notify():
             channels.append(WebhookChannel(webhook))
         notifier = SignalNotifier(channels=channels if channels else None)
         result = notifier.notify_signal(symbol, action, price=price, strategy=strategy)
-        st.success(f"已推送：{result['delivered']}/{result['total']} 渠道成功")
-        st.json(result["results"])
-        st.subheader("推送历史")
+        _ok_all = result["delivered"] == result["total"]
+        theme.kpi_grid([
+            {"label": "成功渠道", "value": f"{result['delivered']}/{result['total']}",
+             "color": "#00d486" if _ok_all else "#ffb020"},
+            {"label": "动作", "value": action},
+            {"label": "标的", "value": symbol},
+            {"label": "策略", "value": strategy},
+        ], columns=4)
+        with st.expander("查看推送明细 JSON"):
+            st.json(result["results"])
+        theme.section_header("推送历史")
         st.dataframe(pd.DataFrame([h["event"] for h in notifier.history]),
                      use_container_width=True)
 
@@ -541,16 +896,19 @@ def page_montecarlo():
             mc = (bootstrap(eq, n=int(n_sim), block=int(block), init_cash=init_cash)
                   if method == "bootstrap"
                   else parametric(eq, n=int(n_sim), init_cash=init_cash))
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("中位收益", f"{mc['median_return'] * 100:.1f}%")
-        c2.metric("P5~P95", f"{mc['p5'] * 100:.1f}% ~ {mc['p95'] * 100:.1f}%")
-        c3.metric("亏损概率", f"{mc['prob_loss'] * 100:.1f}%")
-        c4.metric("最差回撤", f"{mc['worst_max_drawdown'] * 100:.1f}%")
+        _med = mc['median_return']
+        theme.kpi_grid([
+            {"label": "中位收益", "value": f"{_med * 100:.1f}%", "color": RED if _med >= 0 else GREEN},
+            {"label": "P5~P95", "value": f"{mc['p5'] * 100:.1f}% ~ {mc['p95'] * 100:.1f}%"},
+            {"label": "亏损概率", "value": f"{mc['prob_loss'] * 100:.1f}%", "color": RED if mc['prob_loss'] > 0.5 else ACCENT},
+            {"label": "最差回撤", "value": f"{mc['worst_max_drawdown'] * 100:.1f}%", "color": GREEN},
+        ], columns=4)
         fig = go.Figure()
         fig.add_trace(go.Histogram(x=mc["returns"] * 100, nbinsx=60, marker_color=ACCENT))
         fig.update_layout(height=380, template="plotly_dark",
                           title="模拟期末收益分布(%)", margin=dict(l=20, r=20, t=30, b=20))
-        st.plotly_chart(fig, use_container_width=True)
+        chart_panel("", fig)
+        theme.badge("🎲 蒙特卡洛模拟 · 基于回测收益重采样", kind="info")
 
 
 # ---------------- 11. 参数优化 ----------------
@@ -579,7 +937,8 @@ def page_param():
     if st.button("▶ 开始优化", type="primary", key="pa_run"):
         from lianghua.data.gateway import DataGateway
         gw = DataGateway()
-        df, _w = gw_fetch(gw, symbol, str(start), str(end), asset=AssetType.STOCK)
+        with st.spinner("拉取行情数据..."):
+            df, _w = gw_fetch(gw, symbol, str(start), str(end), asset=AssetType.STOCK)
         if _w: st.warning(_w)
         if df.empty:
             st.error("数据为空")
@@ -590,7 +949,7 @@ def page_param():
         with st.spinner("遍历参数中..."):
             if mode == "grid":
                 res = grid_search(df, make_sma_signals, grid, run_backtest=rb)
-                st.subheader("参数评分排名（按夏普降序）")
+                theme.section_header("参数评分排名（按夏普降序）")
                 st.dataframe(res, use_container_width=True)
             else:
                 oos, best = walk_forward(df, make_sma_signals, grid, run_backtest=rb)
@@ -598,7 +957,7 @@ def page_param():
                 c1, c2 = st.columns(2)
                 c1.metric("平均样本外夏普", f"{oos_mean:.3f}")
                 c2.metric("窗口数", len(oos))
-                st.subheader("各窗口最优参数")
+                theme.section_header("各窗口最优参数")
                 st.dataframe(pd.DataFrame(best), use_container_width=True)
 
 
@@ -634,8 +993,13 @@ def make_2row(s1, s2, name1, name2, bar2=True):
     from plotly.subplots import make_subplots
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
                         row_heights=[0.6, 0.4], vertical_spacing=0.04)
+    s1v = np.asarray(s1.values, dtype=float)
+    up = bool(s1v[-1] >= s1v[0]) if len(s1v) else True
+    c1 = RED if up else GREEN
+    fill1 = "rgba(255,77,79,0.10)" if up else "rgba(0,212,134,0.10)"
     fig.add_trace(go.Scatter(x=s1.index, y=s1.values, name=name1,
-                             line=dict(color=ACCENT)), row=1, col=1)
+                             line=dict(color=c1, width=2),
+                             fill="tozeroy", fillcolor=fill1), row=1, col=1)
     if bar2:
         fig.add_trace(go.Bar(x=s2.index, y=s2.values, name=name2,
                              marker_color="#8898ff"), row=2, col=1)
@@ -665,17 +1029,25 @@ def page_strategies():
     end = str(st.date_input("结束", datetime.date(2024, 6, 30), key="sl_end"))
     # 展示选中策略的详细描述（中文）
     st.info(f"**{STRATEGY_CN.get(strat, strat)}** — {STRATEGY_DETAIL.get(strat, '')}")
+    with st.expander("📚 全部策略一览（点击展开）"):
+        _all = pd.DataFrame({"策略(EN)": STRATEGY_NAMES,
+                             "名称(CN)": [STRATEGY_CN.get(n, n) for n in STRATEGY_NAMES],
+                             "说明": [STRATEGY_DETAIL.get(n, "") for n in STRATEGY_NAMES]})
+        st.dataframe(_all, use_container_width=True, height=320)
+        theme.csv_export(_all, "all_strategies.csv", label="⬇ 导出全部策略 CSV")
     if st.button("生成信号", key="sl_run"):
         try:
             gw = DataGateway()
-            df, _w = gw_fetch(gw, symbol, start, end, asset=AssetType.STOCK)
+            with st.spinner("拉取行情数据..."):
+                df, _w = gw_fetch(gw, symbol, start, end, asset=AssetType.STOCK)
             if _w: st.warning(_w)
             if df.empty:
-                st.error("无数据（离线降级演示）")
+                theme.empty_state("无数据（离线降级演示）", icon="📡")
                 return
             sig = reg_get_strategy(strat).generate_signals(df)
             res = vectorized_backtest(df, sig)
-            st.plotly_chart(equity_chart(res["equity"], f"{symbol} · {STRATEGY_CN.get(strat, strat)}"))
+            chart_panel("", equity_chart(res["equity"], f"{symbol} · {STRATEGY_CN.get(strat, strat)}"))
+            theme.badge("📈 回测净值 · 基于历史行情", kind="info")
             m = res["metrics"]
             cc1, cc2, cc3, cc4 = st.columns(4)
             eq_first = res["equity"].iloc[0]
@@ -686,6 +1058,42 @@ def page_strategies():
             cc4.metric("换手", f"{res['num_changes']}")
         except Exception as e:
             st.error(f"策略运行失败：{e}")
+
+    st.divider()
+    theme.section_header("策略一键对比", "同一标的 · 多个策略横向比较", icon="⚖️")
+    _cmp_sel = st.multiselect("选择对比策略", STRATEGY_NAMES,
+                              default=STRATEGY_NAMES[:5], key="sl_cmp")
+    if st.button("▶ 运行对比", key="sl_cmp_run"):
+        try:
+            gw = DataGateway()
+            with st.spinner("拉取行情数据..."):
+                df, _w = gw_fetch(gw, symbol, start, end, asset=AssetType.STOCK)
+            if _w: st.warning(_w)
+            if df.empty:
+                theme.empty_state("无数据（离线降级演示）", icon="📡")
+            else:
+                _rows = []
+                for s in _cmp_sel:
+                    try:
+                        _sig = reg_get_strategy(s).generate_signals(df)
+                        _r = vectorized_backtest(df, _sig)
+                        _m = _r["metrics"]
+                        _eq0 = _r["equity"].iloc[0]
+                        _cum = (_r["equity"].iloc[-1] / _eq0 - 1) if (pd.notna(_eq0) and _eq0) else float("nan")
+                        _rows.append({"策略": STRATEGY_CN.get(s, s), "累计收益": safe_pct(_cum),
+                                      "夏普": safe_num(_m["sharpe"]),
+                                      "最大回撤": safe_pct(_m["max_drawdown"]),
+                                      "换手次数": _r["num_changes"]})
+                    except Exception as _e:
+                        _rows.append({"策略": STRATEGY_CN.get(s, s), "累计收益": "—",
+                                      "夏普": "—", "最大回撤": "—",
+                                      "换手次数": str(_e)[:30]})
+                _cmp_df = pd.DataFrame(_rows)
+                st.dataframe(_cmp_df, use_container_width=True)
+                theme.csv_export(_cmp_df, f"strategy_compare_{symbol}.csv",
+                                 label="⬇ 导出对比 CSV")
+        except Exception as e:
+            st.error(f"对比失败：{e}")
 
 
 # ---------------- 组合优化（迭代39-50/85-100） ----------------
@@ -726,7 +1134,8 @@ def page_factor():
     if st.button("运行因子研究"):
         try:
             gw = DataGateway()
-            df, _w = gw_fetch(gw, symbol, start, end, asset=AssetType.STOCK)
+            with st.spinner("拉取行情数据..."):
+                df, _w = gw_fetch(gw, symbol, start, end, asset=AssetType.STOCK)
             if _w: st.warning(_w)
             close = df.set_index("date")["close"]
             # 演示：用内置因子引擎 + 随机因子
@@ -760,10 +1169,11 @@ def page_indicator_lab():
     if st.button("▶ 运行指标", key="il_run"):
         try:
             gw = DataGateway()
-            df, _w = gw_fetch(gw, symbol, start, end, asset=AssetType.STOCK)
+            with st.spinner("拉取行情数据..."):
+                df, _w = gw_fetch(gw, symbol, start, end, asset=AssetType.STOCK)
             if _w: st.warning(_w)
             if df is None or df.empty:
-                st.error("无数据（离线降级演示）")
+                theme.empty_state("无数据（离线降级演示）", icon="📡")
                 return
             df = df.copy()
             df["date"] = pd.to_datetime(df["date"])
@@ -779,7 +1189,7 @@ def page_indicator_lab():
                                          line=dict(color=ACCENT)))
                 fig.update_layout(height=380, template="plotly_dark", title=name,
                                   margin=dict(l=20, r=20, t=30, b=20))
-                st.plotly_chart(fig, use_container_width=True)
+                chart_panel("", fig)
             else:
                 st.dataframe(out, use_container_width=True)
             st.caption(f"输出维度：{getattr(out, 'shape', 'scalar')}")
@@ -804,10 +1214,11 @@ def page_perf_risk():
     if st.button("▶ 运行", key="pr_run"):
         try:
             gw = DataGateway()
-            df, _w = gw_fetch(gw, symbol, start, end, asset=AssetType.STOCK)
+            with st.spinner("拉取行情数据..."):
+                df, _w = gw_fetch(gw, symbol, start, end, asset=AssetType.STOCK)
             if _w: st.warning(_w)
             if df is None or df.empty:
-                st.error("无数据（离线降级演示）")
+                theme.empty_state("无数据（离线降级演示）", icon="📡")
                 return
             eq = df.set_index("date")["close"].astype(float)
             for label, funcs, nm in (("绩效", PERF_FUNCS, pname), ("风险", RISK_FUNCS, rname)):
@@ -833,13 +1244,15 @@ def page_perf_risk():
 # ---------------- 数据·执行能力（迭代181+，超目标） ----------------
 def page_data_exec():
     st.header("🔌 数据 · 执行能力")
-    st.subheader("数据源（多源适配器）")
-    st.write("可用源：", list_sources())
+    theme.section_header("数据源", "多源适配器", icon="🔌")
+    for _s in list_sources():
+        theme.chip(_s)
     src = st.selectbox("选择数据源", list_sources())
     sym = st.text_input("标的代码", "600519.SH", key="de_sym")
     render_symbol_name(sym, "stock")
     if st.button("▶ 取数预览", key="de_fetch"):
-        df = fetch_from(src, sym, "2023-01-01", "2023-06-30", asset=AssetType.STOCK)
+        with st.spinner("从数据源取数中..."):
+            df = fetch_from(src, sym, "2023-01-01", "2023-06-30", asset=AssetType.STOCK)
         if df is None or df.empty:
             reason = last_error(src)
             msg = "该源无数据（离线或库缺失，可换 synthetic）"
@@ -848,13 +1261,14 @@ def page_data_exec():
             st.error(msg)
         else:
             st.dataframe(df.head(), use_container_width=True)
-    st.subheader("成分 universe")
+    theme.section_header("成分 universe")
     univ = st.selectbox("universe", list_universes())
     if st.button("▶ 查看成分", key="de_univ"):
         st.json(get_universe(univ))
-    st.subheader("纸面券商 + 括号单演示")
+    theme.section_header("纸面券商 + 括号单演示")
     if st.button("▶ 运行执行演示", key="de_run"):
-        broker = make_broker("paper", slippage=0.001)
+        with st.spinner("提交纸面订单并评估括号单..."):
+            broker = make_broker("paper", slippage=0.001)
         o = bracket_order(sym, "BUY", 100, 100.0, 95.0, 108.0, asset_type=AssetType.STOCK)
         res = broker.submit(o["entry"])
         acct = broker.get_account({sym: 100.0 * 100})
@@ -864,21 +1278,37 @@ def page_data_exec():
 
 # ---------------- 能力总览（迭代181+） ----------------
 def page_capabilities():
-    st.header("🗺️ 能力总览")
+    theme.section_header("能力总览", "平台全量能力（注册表驱动，自动发现）", icon="🗺️")
     cap = list_capabilities()
     sc = summary_counts()
-    st.subheader("平台能力计数")
-    st.json(sc)
+    theme.kpi_grid([
+        {"label": "策略", "value": len(STRATEGY_NAMES), "color": ACCENT},
+        {"label": "优化器", "value": len(OPTIMIZER_NAMES), "color": ACCENT},
+        {"label": "技术指标", "value": len(INDICATOR_FUNCS), "color": ACCENT},
+        {"label": "风险函数", "value": sc.get("risk_functions", 0), "color": ACCENT},
+        {"label": "绩效函数", "value": sc.get("perf_functions", 0), "color": ACCENT},
+        {"label": "因子函数", "value": sc.get("factor_functions", 0), "color": ACCENT},
+        {"label": "期权组合", "value": len(OPTION_COMBO_REGISTRY), "color": ACCENT},
+        {"label": "数据源", "value": len(list_sources()), "color": ACCENT},
+    ], columns=4)
+
+    theme.section_header("覆盖矩阵", "四类资产 · 一个终端", icon="🧩")
     c1, c2 = st.columns(2)
     with c1:
-        st.write("**指标数**：", len(cap["indicators"]))
-        st.write("**期权组合策略**：", list(cap["option_combos"].keys()))
+        theme.card("指标数", str(len(cap["indicators"])))
+        theme.card("期权组合策略", "、".join(cap["option_combos"].keys()))
     with c2:
-        st.write("**数据源**：", cap["data"])
-        st.write("**执行能力**：", cap["execution"])
-    st.subheader("策略 / 优化器（注册表驱动，自动发现）")
-    st.write("**策略**：", [STRATEGY_CN.get(n, n) for n in STRATEGY_NAMES])
-    st.write("**优化器**：", OPTIMIZER_NAMES)
+        theme.card("数据源", "、".join(cap["data"]))
+        theme.card("执行能力", "、".join(cap["execution"]))
+
+    theme.section_header("策略 / 优化器注册表", "新增即自动出现在 UI", icon="🧭")
+    _strat_df = pd.DataFrame({"策略(EN)": STRATEGY_NAMES,
+                              "名称(CN)": [STRATEGY_CN.get(n, n) for n in STRATEGY_NAMES]})
+    with st.expander("展开全部策略（中文名）"):
+        st.dataframe(_strat_df, use_container_width=True)
+    with st.expander("展开全部优化器"):
+        st.dataframe(pd.DataFrame({"优化器(EN)": OPTIMIZER_NAMES}), use_container_width=True)
+    theme.csv_export(_strat_df, "strategies.csv", label="⬇ 导出策略清单 CSV")
 
 
 # ---------------- 实时行情（K 线查看，全资产） ----------------
@@ -890,6 +1320,88 @@ def page_quote():
     """
     st.header("📉 实时行情 · K 线查看")
     st.caption("覆盖股票 / 基金 / 期货 / 期权四类资产；真实行情优先，断网或 unavailable 时自动降级为演示数据并明确提示。")
+    # 后端连接状态：优先走真实行情后端 HTTP API
+    if backend_online():
+        theme.badge("🟢 真实行情后端已连接 — 本页优先从后端拉取真实数据", kind="ok")
+    else:
+        theme.badge("🟡 未检测到真实行情后端", kind="warn")
+        st.caption(f"点击「拉取行情」将使用内置网关；启动后端可获得更快的真实数据："
+                   f"`python backend/data_server.py --live-poll 30`")
+
+    # —— 自选实时报价（后端 watchlist，优先真实行情后端）——
+    with st.expander("📋 自选实时报价（后端 watchlist）", expanded=False):
+        # 手动添加标的到当前会话自选（不改动 watchlist.json）
+        if "q_extra_wl" not in st.session_state:
+            st.session_state.q_extra_wl = []
+        _ac1, _ac2, _ac3 = st.columns([2, 1, 1])
+        with _ac1:
+            _new_sym = st.text_input("添加标的到自选", "", key="q_add_sym",
+                                     placeholder="如 000001.SZ / 510300.SH")
+        with _ac2:
+            _new_asset = st.selectbox("资产类型", ["stock", "fund", "future", "option"],
+                                      key="q_add_asset")
+        with _ac3:
+            st.write("")
+            if st.button("＋ 添加", key="q_add_btn"):
+                if _new_sym.strip():
+                    st.session_state.q_extra_wl.append(
+                        {"symbol": _new_sym.strip(), "asset": _new_asset,
+                         "name": _new_sym.strip()})
+        if st.session_state.q_extra_wl:
+            if st.button("🗑 清空手动自选", key="q_clear_wl"):
+                st.session_state.q_extra_wl = []
+        _wl = load_watchlist() + st.session_state.q_extra_wl
+        if not _wl:
+            theme.empty_state("未找到 backend/watchlist.json")
+        elif not backend_online():
+            st.info(f"未检测到真实行情后端（{DATA_BACKEND_BASE}）。启动后端后此处显示自选实时报价："
+                     f" `python backend/data_server.py --live-poll 30`")
+        else:
+            # 优先批量取数（一次往返拉全自选），降低后端往返；
+            # 并探测并展示 SSE 推送能力（秒级刷新 vs 轮询）
+            _symbols = [str(_it["symbol"]) for _it in _wl]
+            if backend_supports_sse():
+                theme.badge("📡 实时推送已启用 · SSE 秒级刷新", kind="ok")
+                # 真·消费 SSE 推送流：取最近一次批量推送快照（秒级刷新），
+                # 失败则退回批量轮询；绝不因推送失败而中断页面。
+                _snap = stream_quotes_snapshot(_symbols, seconds=3, interval=2)
+                _batch = {str(q.get("symbol")): q for q in _snap} if _snap else {}
+                if not _batch:
+                    _batch = {str(q.get("symbol")): q
+                              for q in fetch_quote_batch_backend(_symbols)}
+            else:
+                theme.badge("🔄 轮询模式 · 单条取数", kind="info")
+                _batch = {str(q.get("symbol")): q
+                          for q in fetch_quote_batch_backend(_symbols)}
+            _quotes = []
+            for _it in _wl:
+                _q = (_batch.get(str(_it["symbol"]))
+                      or fetch_quote_backend(_it["symbol"], _it.get("asset")))
+                if _q:
+                    _quotes.append((_it, _q))
+            if not _quotes:
+                theme.empty_state("实时报价获取中…（后端离线或暂未预热）", icon="⏳")
+            else:
+                _cols = st.columns(min(len(_quotes), 4))
+                for _i, (_it, _q) in enumerate(_quotes):
+                    _p = _q.get("price")
+                    _pct = _q.get("pct_change")
+                    _name = _it.get("name", _it["symbol"])
+                    if _p is not None and _p == _p:
+                        _up = (_pct or 0) >= 0
+                        _col = RED if _up else GREEN
+                        _arrow = "▲" if _up else "▼"
+                        _price_txt = (f"**{_name}**\n\n**{_p:.2f}**  "
+                                      f"{_arrow}{abs(_pct*100):.2f}%" if _pct is not None
+                                      else f"**{_name}**\n\n**{_p:.2f}**")
+                        with _cols[_i % 4]:
+                            st.markdown(f'<div style="color:{_col};font-size:13px">{_price_txt}</div>',
+                                        unsafe_allow_html=True)
+                            theme.source_badge(_q.get("source", ""), bool(_q.get("was_demo")))
+
+    # 自动刷新实时盘口（opt-in，默认关闭，避免无谓轮询）
+    st.checkbox("🔄 自动刷新实时盘口（每 15 秒）", value=False, key="q_auto",
+                help="开启后页面每 15 秒自动刷新一次实时报价/盘口")
 
     asset = st.radio("资产类别", list(ASSET_LABELS.keys()),
                      format_func=lambda a: ASSET_LABELS[a], horizontal=True, key="q_asset")
@@ -939,18 +1451,58 @@ def page_quote():
         lookback_days = st.slider("回看交易日", 20, 250, 120, key="q_days")
     with col2:
         chart_kind = st.selectbox("图表类型", ["蜡烛图", "收盘价线"], key="q_kind")
-    if st.button("▶ 拉取行情", key="q_run"):
+    c_run, c_ref = st.columns(2)
+    with c_run:
+        run_clicked = st.button("▶ 拉取行情", key="q_run")
+    with c_ref:
+        refresh_clicked = st.button("🔄 强制刷新(回源)", key="q_refresh",
+                                    help="忽略本地缓存，强制从 AKShare 真实源重新拉取该标的")
+    if run_clicked or refresh_clicked:
+        _force = bool(refresh_clicked)
         try:
-            gw = DataGateway()
             end = datetime.date.today()
             start = end - datetime.timedelta(days=int(lookback_days) * 2 + 30)
-            df, warn = gw_fetch(gw, sym, str(start), str(end), asset=AssetType(asset))
+            at = AssetType(asset)
+            # 优先真实行情后端（HTTP API）；不可用回退内置网关
+            res = fetch_history_backend(sym, str(start), str(end), asset=at, force_refresh=_force)
+            if res is not None:
+                df, warn = res
+            else:
+                gw = DataGateway()
+                df, warn = gw_fetch(gw, sym, str(start), str(end), asset=at)
             if warn:
                 st.warning(warn)
             if df is None or df.empty:
-                st.error("无行情数据（离线降级也未生成，请检查代码/网络）。")
+                theme.empty_state("暂无该标的行情数据（离线降级也未生成，请检查代码/网络）", icon="📡")
                 return
             df = df.sort_values("date").tail(int(lookback_days))
+            # —— 实时盘口（优先后端 /api/quote，回退内置网关）——
+            _prev_close = float(df["close"].iloc[-1]) if "close" in df.columns and not df.empty else None
+            _live = fetch_quote_backend(sym, at) if backend_online() else None
+            if _live is None:
+                try:
+                    _lgw = DataGateway()
+                    _lq = _lgw.live_quote(sym, asset=at)
+                    _live = {"price": _lq.get("price"), "source": _lq.get("source"),
+                             "was_demo": getattr(_lgw, "last_was_demo", False),
+                             "change": None, "pct_change": None}
+                except Exception:
+                    _live = None
+            if _live and _live.get("price") == _live.get("price"):  # 排除 NaN
+                _lp = float(_live["price"])
+                _pct = _live.get("pct_change")
+                if _pct is None and _prev_close:
+                    _pct = (_lp - _prev_close) / _prev_close
+                _lc = RED if (_pct is not None and _pct >= 0) else GREEN
+                st.markdown("### 📡 实时盘口")
+                _c1, _c2 = st.columns([1, 2])
+                with _c1:
+                    st.metric("实时价", f"{_lp:.2f}",
+                              delta=f"{_pct*100:+.2f}%" if _pct is not None else "—",
+                              delta_color="inverse")
+                with _c2:
+                    st.markdown("**数据来源**")
+                    theme.source_badge(_live.get("source", ""), bool(_live.get("was_demo")))
             is_option = (asset == "option")
             if is_option:
                 # 期权无传统 OHLC K 线：展示期权价格走势 + 关键 Greeks 概要
@@ -974,6 +1526,15 @@ def page_quote():
                                   margin=dict(l=20, r=20, t=30, b=20),
                                   title=f"{sym} · {get_symbol_name(sym, asset)} · 期权行情(价格+Greeks)")
                 st.plotly_chart(fig, use_container_width=True)
+
+                # 数据来源追溯（期权行情同样遵循「降级可观测」铁律）
+                if warn and "演示" in warn:
+                    theme.source_badge("demo", True)
+                elif warn and "cache" in warn:
+                    theme.source_badge("cache", False)
+                else:
+                    theme.source_badge("akshare", False)
+
                 greeks = df[["date", "option_price", "delta", "gamma", "vega", "theta", "rho"]].copy()
                 greeks["date"] = greeks["date"].astype(str)
                 st.dataframe(greeks, use_container_width=True)
@@ -994,14 +1555,27 @@ def page_quote():
                 st.caption(f"累计成交量：{vol:,.0f}　|　最近交易日：{df['date'].iloc[-1].date()}　|　数据行数：{len(df)}")
 
                 if chart_kind == "蜡烛图":
-                    fig = go.Figure(data=[go.Candlestick(
+                    from plotly.subplots import make_subplots
+                    _o = df["open"].astype(float).values
+                    _c = df["close"].astype(float).values
+                    _vol_colors = [RED if c >= o else GREEN for o, c in zip(_o, _c)]
+                    fig = make_subplots(
+                        rows=2, cols=1, shared_xaxes=True,
+                        row_heights=[0.74, 0.26], vertical_spacing=0.03,
+                        subplot_titles=("K 线", "成交量"))
+                    fig.add_trace(go.Candlestick(
                         x=df["date"],
                         open=df["open"], high=df["high"], low=df["low"], close=df["close"],
                         increasing=dict(line=dict(color=RED), fillcolor=RED),
                         decreasing=dict(line=dict(color=GREEN), fillcolor=GREEN),
                         name="K线",
-                    )])
-                    fig.update_layout(yaxis_title="价格", xaxis_title="日期")
+                    ), row=1, col=1)
+                    fig.add_trace(go.Bar(
+                        x=df["date"], y=df["volume"], name="成交量",
+                        marker_color=_vol_colors, opacity=0.8), row=2, col=1)
+                    fig.update_layout(yaxis_title="价格", xaxis_title="日期",
+                                      xaxis_rangeslider_visible=True)
+                    fig.update_yaxes(title_text="成交量", row=2, col=1)
                 else:
                     fig = go.Figure(data=[go.Scatter(
                         x=df["date"], y=df["close"], mode="lines",
@@ -1013,12 +1587,26 @@ def page_quote():
                 # 红涨绿跌：上涨 K 线用红、下跌用绿（已在 Candlestick 中设定）
                 st.plotly_chart(fig, use_container_width=True)
 
+                # 数据来源追溯（与「降级可观测」铁律一致，一眼看清图是否可信）
+                if warn and "演示" in warn:
+                    theme.source_badge("demo", True)
+                elif warn and "cache" in warn:
+                    theme.source_badge("cache", False)
+                else:
+                    theme.source_badge("akshare", False)
+
                 with st.expander("查看 OHLCV 明细"):
                     show = df.copy()
                     show["date"] = show["date"].astype(str)
                     st.dataframe(show, use_container_width=True)
+                    theme.csv_export(show, f"{sym}_ohlcv.csv", label="⬇ 导出 OHLCV CSV")
         except Exception as e:
             st.error(f"行情拉取失败：{e}")
+
+    # opt-in 自动刷新：仅在用户勾选时刷新，避免无谓重渲染。
+    # SSE 推送下刷新间隔更短（秒级），否则退化为 15s 轮询。
+    if st.session_state.get("q_auto"):
+        theme.auto_refresh(5 if backend_supports_sse() else 15)
 
 
 # ---------------- 路由 ----------------
@@ -1033,6 +1621,16 @@ def page_live():
     """
     st.header("实盘交易（连接实盘）")
     st.caption("把策略信号经盘前风控后路由到 broker；paper=模拟成交，qmt/pt=真实柜台（需 SDK+账户）。")
+    try:
+        from lianghua.execution.schedule import is_trading_session, next_session
+        _ok, _desc = is_trading_session()
+        _ns = next_session()
+        if _ok:
+            theme.badge(f"🟢 交易中 · {_desc}", kind="ok")
+        else:
+            theme.badge(f"⚪ 盘外 · 下一时段 {_ns.strftime('%m-%d %H:%M')}", kind="info")
+    except Exception:
+        pass
 
     broker_kind = st.selectbox("Broker 类型", ["paper", "sim", "qmt", "pt"])
     strategy = strategy_selectbox("策略", STRATEGY_NAMES)
@@ -1086,11 +1684,11 @@ def _render_live_status(status: dict):
     c3.metric("总权益", "%.0f" % acct.get("equity", 0))
     actions = status.get("actions", [])
     if actions:
-        st.subheader("本次调仓动作")
+        theme.section_header("本次调仓动作")
         st.dataframe(pd.DataFrame(actions))
     orders = status.get("orders", [])
     if orders:
-        st.subheader("最近订单")
+        theme.section_header("最近订单")
         st.dataframe(pd.DataFrame(orders))
 
 # ---------------- 多账户与定时调仓（第十三轮深化） ----------------
@@ -1115,14 +1713,17 @@ def page_multi():
         from lianghua.data.gateway import DataGateway
         _ok, _desc = is_trading_session()
         _ns = next_session()
-        st.info("交易时段状态：**%s**；下一时段：%s" % (_desc, _ns.strftime("%Y-%m-%d %H:%M")))
+        if _ok:
+            theme.badge(f"🟢 交易中 · {_desc}", kind="ok")
+        else:
+            theme.badge(f"⚪ 盘外 · 下一时段 {_ns.strftime('%m-%d %H:%M')}", kind="info")
     except Exception as e:
         st.error("模块加载失败：%s" % e)
         return
 
     _ROOT = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
 
-    st.subheader("① 多账户路由（配置驱动）")
+    theme.section_header("① 多账户路由（配置驱动）")
     _cfg = st.text_area("多账户配置 JSON", value=_MULTI_JSON, height=220)
     try:
         _c = _json.loads(_cfg)
@@ -1145,7 +1746,7 @@ def page_multi():
     if st.session_state.get("multi_status"):
         st.json(st.session_state["multi_status"])
 
-    st.subheader("② 盘中分钟信号探针")
+    theme.section_header("② 盘中分钟信号探针")
     _sym = st.text_input("标的代码", value="600519.SH", key="intraday_sym")
     render_symbol_name(_sym, "stock")
     _freq = st.selectbox("分钟频率", ["1min", "5min", "15min"], index=1)
@@ -1159,7 +1760,7 @@ def page_multi():
         except Exception as e:
             st.error("探测失败：%s" % e)
 
-    st.subheader("③ 定时调仓（automation 驱动）")
+    theme.section_header("③ 定时调仓（automation 驱动）")
     st.caption("由 automation 周期调用 examples/run_live_cron.py，"
                "非交易时段自动跳过。")
     if st.button("立即运行一次定时调仓脚本", key="cron_run"):
@@ -1173,12 +1774,12 @@ def page_multi():
         try:
             _hist = _json.load(open(_sp_path, encoding="utf-8"))
             if _hist:
-                st.subheader("最近一次结果")
+                theme.section_header("最近一次结果")
                 st.json(_hist[-1])
         except Exception:
             pass
 
-    st.subheader("④ 微信推送测试（第十四轮）")
+    theme.section_header("④ 微信推送测试（第十四轮）")
     _wx_key = st.text_input("企业微信群机器人 Webhook Key（可选，填 key= 后内容）",
                             value="", key="wx_key")
     if st.button("测试群机器人推送", key="wx_test") and _wx_key:
@@ -1209,7 +1810,133 @@ def page_multi():
         st.json(st.session_state["rebal"])
 
 
+# ---------------- 首页 · 仪表盘 ----------------
+def page_home():
+    """仪表盘首页：平台能力概览 + 快捷入口。"""
+    from lianghua.execution.schedule import is_trading_session, next_session
+    try:
+        _ok, _desc = is_trading_session()
+        _ns = next_session()
+        _badge = f"盘中 · {_desc}" if _ok else f"盘外 · 下一时段 {_ns.strftime('%m-%d %H:%M')}"
+    except Exception:
+        _badge = "交易时段未知"
+    theme.hero("Lianghua Quant 多资产量化终端",
+               "股票 · 基金 · 期货 · 期权 —— 一体化研究 / 回测 / 实盘",
+               badge=_badge)
+
+    # 能力计数（注册表驱动）
+    sc = summary_counts()
+    n_ind = len(INDICATOR_FUNCS)
+    n_opt_combo = len(OPTION_COMBO_REGISTRY)
+    n_src = len(list_sources())
+    theme.kpi_grid([
+        {"label": "策略", "value": len(STRATEGY_NAMES), "color": ACCENT},
+        {"label": "优化器", "value": len(OPTIMIZER_NAMES), "color": ACCENT},
+        {"label": "技术指标", "value": n_ind, "color": ACCENT},
+        {"label": "风险函数", "value": sc.get("risk_functions", 0), "color": ACCENT},
+        {"label": "绩效函数", "value": sc.get("perf_functions", 0), "color": ACCENT},
+        {"label": "因子函数", "value": sc.get("factor_functions", 0), "color": ACCENT},
+        {"label": "期权组合", "value": n_opt_combo, "color": ACCENT},
+        {"label": "数据源", "value": n_src, "color": ACCENT},
+    ], columns=4)
+
+    # —— 快速开始（三步引导，降低上手门槛）——
+    theme.section_header("快速开始", "三步跑通你的第一个回测", icon="🚀")
+    _qs = [
+        ("① 选标的", "在「实时行情」搜代码 / 拼音首字母，或回测页直接输入如 600519.SH"),
+        ("② 选策略", "单标的回测挑 SMA / RSI 等策略，或策略库「一键对比」多个策略"),
+        ("③ 看结果", "运行后看净值曲线 + 绩效瓦片，一键导出 CSV 落地你的分析"),
+    ]
+    _qsc = st.columns(3)
+    for i, (_t, _d) in enumerate(_qs):
+        with _qsc[i % 3]:
+            theme.card(_t, _d)
+
+    # 首页动态感：示例净值迷你走势（演示数据，仅用于视觉引导，非真实行情）
+    _demo_eq = [1.0, 1.02, 0.99, 1.05, 1.03, 1.08, 1.12, 1.10, 1.15, 1.20, 1.18, 1.25]
+    _sp1, _sp2 = st.columns([1, 2])
+    with _sp1:
+        theme.sparkline(_demo_eq, width=180, height=72, label="示例净值 · 演示")
+    with _sp2:
+        theme.tip("上图是演示用的示例净值走势，用于直观感受终端图表观感；"
+                  "真实净值请在「单标的回测」运行后查看（红涨绿跌）。")
+
+    # —— 真实行情后端状态（迭代：连接后端则展示实时健康度）——
+    theme.section_header("数据后端", "真实行情服务能力", icon="🔌")
+    _online = backend_online()
+    _health = None
+    if _online:
+        try:
+            _health = _http_get_json(f"{DATA_BACKEND_BASE}/api/health", timeout=2)
+        except Exception:
+            _health = None
+    if _health:
+        theme.badge("🟢 数据后端在线", kind="ok")
+        theme.kpi_grid([
+            {"label": "后端状态", "value": "🟢 在线", "color": "#00d486"},
+            {"label": "数据源", "value": "AKShare" if _health.get("akshare_available") else "离线", "color": ACCENT},
+            {"label": "缓存标的", "value": _health.get("cached_symbols", 0), "color": ACCENT},
+            {"label": "自选监控", "value": _health.get("watchlist_size", 0), "color": ACCENT},
+        ], columns=4)
+        theme.tip(f"后端地址 {DATA_BACKEND_BASE} · 最近来源：{_health.get('last_source')} · "
+                  f"内存实时缓存：{_health.get('live_cached', 0)} 条 · "
+                  f"最近降级：{_health.get('recent_errors')[-1] if _health.get('recent_errors') else '无'}")
+    else:
+        theme.badge("🟡 数据后端未连接", kind="warn")
+        theme.kpi_grid([
+            {"label": "后端状态", "value": "🟡 未连接", "color": "#ffb020"},
+            {"label": "当前数据", "value": "内置网关", "color": ACCENT},
+        ], columns=4)
+        st.info(f"未检测到真实行情后端（{DATA_BACKEND_BASE}）。启动后终端可获得更快的真实数据："
+                 f"`python backend/data_server.py --live-poll 30`")
+
+    theme.section_header("快捷入口", "点击直达常用模块", icon="🚀")
+    links = [
+        ("单标的回测", "经典择时策略回测", "📈", "回测分析"),
+        ("实时行情", "全资产 K 线 / 行情", "📉", "信号 · 执行"),
+        ("策略库", "40 个内置策略信号预览", "🧭", "资产 · 策略"),
+        ("组合优化", "28 种优化器权重求解", "🧮", "资产 · 策略"),
+        ("因子研究", "IC / 多空因子检验", "🔬", "资产 · 策略"),
+        ("实盘交易", "连接 paper / 真实柜台", "🔌", "信号 · 执行"),
+    ]
+    cols = st.columns(3)
+    for i, (title, desc, icon, cat) in enumerate(links):
+        with cols[i % 3]:
+            if st.button(f"{icon}  {title}", key=f"ql_{i}", use_container_width=True):
+                _goto(cat, title)
+            st.caption(desc)
+
+    theme.section_header("能力矩阵", "四类资产 · 一个终端", icon="🗺️")
+    theme.card("覆盖资产", "股票 / 基金 / 期货 / 期权，统一红涨绿跌配色与数据网关。")
+    theme.card("研究链路", "指标实验室 · 因子研究 · 绩效风险分析 · 组合优化，注册表驱动自动发现。")
+    theme.card("实盘连接", "paper 模拟 + qmt / pt 真实柜台双保险；盘中止损 / 再平衡 / 微信推送。")
+    theme.tip("离线环境下数据网关会自动降级为演示(假)数据，页面会明确提示；"
+              "以此跑出的回测仅供功能验证，不代表真实行情。")
+
+    # —— 数据健康（迭代：缓存真实 vs 演示覆盖）——
+    if _online:
+        try:
+            _cache = _http_get_json(f"{DATA_BACKEND_BASE}/api/cache", timeout=3)
+            if isinstance(_cache, dict) and _cache:
+                _real = sum(1 for v in _cache.values()
+                            if str(v.get("source")) not in ("demo", "none", ""))
+                _demo = len(_cache) - _real
+                theme.section_header("数据健康", "本地缓存覆盖（离线回测也可信）", icon="🩺")
+                theme.kpi_grid([
+                    {"label": "缓存标的数", "value": len(_cache), "color": ACCENT},
+                    {"label": "真实数据", "value": _real, "color": "#00d486"},
+                    {"label": "演示降级", "value": _demo, "color": "#ff4d4f" if _demo else ACCENT},
+                ], columns=3)
+                _sample = "; ".join(
+                    f"{s}({v.get('rows')}行,{v.get('source')})"
+                    for s, v in list(_cache.items())[:6])
+                theme.tip(f"样本：{_sample}{' …' if len(_cache) > 6 else ''}")
+        except Exception:
+            pass
+
+
 PAGES = {
+    "首页": page_home,
     "单标的回测": page_single,
     "组合·篮子回测": page_basket,
     "统一编排(多资产)": page_orchestrator,
@@ -1234,3 +1961,4 @@ PAGES = {
         "实时行情": page_quote,
     }
 PAGES[PAGE]()
+theme.render_footer(version="1.6.0-live")

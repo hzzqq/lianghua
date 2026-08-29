@@ -172,6 +172,8 @@ class _StubStreamlit:
 
             def __getattr__(self, n):
                 return lambda *a, **k: None
+        if isinstance(n, (list, tuple)):
+            n = len(n)
         return tuple(_C() for _ in range(int(n)))
 
     def tabs(self, n=1, *a, **k):
@@ -366,6 +368,8 @@ def test_ui_all_pages_smoke():
             return _Col()
 
         def columns(self, n=1, *a, **k):
+            if isinstance(n, (list, tuple)):
+                n = len(n)
             return tuple(_Col() for _ in range(int(n)))
 
         def tabs(self, n=1, *a, **k):
@@ -387,7 +391,7 @@ def test_ui_all_pages_smoke():
         # 全部页面函数（含 迭代181+ 新增 指标实验室/绩效风险分析/数据执行能力/能力总览）
         page_fns = [n for n in dir(app) if n.startswith("page_") and callable(getattr(app, n))]
         assert len(page_fns) >= 20, f"UI 页面数应≥20，实际 {len(page_fns)}"
-        for fn in ["page_single", "page_basket", "page_orchestrator", "page_option",
+        for fn in ["page_home", "page_single", "page_basket", "page_orchestrator", "page_option",
                    "page_future_spread", "page_fund", "page_var", "page_vectorized",
                    "page_notify", "page_montecarlo", "page_param", "page_html",
                    "page_strategies", "page_portfolio", "page_factor",

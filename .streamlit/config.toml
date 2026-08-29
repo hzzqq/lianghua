@@ -1,0 +1,16 @@
+# Lianghua Quant 终端 —— 原生暗色主题
+# 配色与项目「星辰 starfield」调色板对齐：深空底 + 紫蓝渐变强调 + 红涨绿跌
+[theme]
+base = "dark"
+primaryColor = "#667eea"
+backgroundColor = "#0f0f23"
+secondaryBackgroundColor = "#1a1a2e"
+textColor = "#e6e8f0"
+font = "sans serif"
+
+[server]
+headless = false
+runOnSave = false
+
+[browser]
+gatherUsageStats = false
