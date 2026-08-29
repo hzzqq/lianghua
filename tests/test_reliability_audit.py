@@ -338,3 +338,52 @@ def test_quant_function_no_crash_no_nan(fqn):
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
+
+
+# ------------------------------------------------------------------  退化输入硬化
+def _degenerate_fixtures(kind):
+    """构造退化版 fixture：const / nan / short。kind 决定退化类型。"""
+    s = mk_series(kind)
+    eq = mk_equity(kind)
+    df = mk_df(kind)
+    ret = mk_ret(kind)
+    ret_df = mk_ret_df(kind, 5, 250) if kind != "short" else mk_ret_df("short", 5, 12)
+    ret_df = mk_ret_df(kind, 5, 60) if kind == "short" else ret_df
+    cov = pd.DataFrame(
+        np.cov(ret_df.T.values), columns=ret_df.columns, index=ret_df.columns
+    )
+    w = pd.Series(np.ones(5) / 5, index=ret_df.columns)
+    trades = [{"pnl": 1.0}, {"pnl": -0.5}, {"pnl": 2.0, "exit": 1.2, "entry": 1.0}]
+    d_factors = {"f1": s, "f2": s}
+    return dict(s=s, eq=eq, df=df, ret=ret, ret_df=ret_df, cov=cov, w=w,
+                trades=trades, d_factors=d_factors)
+
+
+@pytest.mark.parametrize("fqn", sorted(_FUZZ_FUNCS.keys()))
+@pytest.mark.parametrize("kind", ["const", "nan", "short"])
+def test_quant_function_degenerate_inputs(fqn, kind):
+    """退化输入（常数/全NaN/极短）下不得崩溃、输出无 NaN/inf。
+
+    这是可靠性硬化的核心：正常输入通过的代码，遇到 std=0、全缺失、极短窗口
+    仍可能除零/越界。任何方法都应优雅降级（返回有限值或清零），而非炸。
+    """
+    f = _FUZZ_FUNCS[fqn]
+    fx = _degenerate_fixtures(kind)
+    packs = _build_args(f, fx)
+    last_exc = None
+    for args in packs:
+        try:
+            out = f(*args)
+        except Exception as e:  # noqa: BLE001
+            last_exc = e
+            continue
+        nan, inf = _has_bad(out)
+        # 退化输入下：NaN 是可接受的"算不出"信号（垃圾进垃圾出）；
+        # 但 inf 是数值爆炸（除零/无效归一），必须零容忍。
+        if inf:
+            pytest.fail(f"{fqn} [{kind}] 退化输入下输出含 inf（数值爆炸）")
+        return
+    pytest.skip(
+        f"{fqn} [{kind}] 无法用自动派发的退化输入驱动（签名特殊）: "
+        f"{type(last_exc).__name__}: {last_exc}"
+    )

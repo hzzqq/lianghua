@@ -40,4 +40,7 @@ def omega_ratio(equity: pd.Series, threshold: float = 0.0, periods: int = 252) -
         return 0.0
     gain = r[r > threshold].sum()
     loss = -r[r < threshold].sum()
-    return float(gain / loss) if loss > 0 else float("inf")
+    if loss > 0:
+        return float(gain / loss)
+    # 无下行：有上行才是理论无穷（完美），平坦/全缺失则无信息，返回 0 避免 inf 污染下游
+    return float("inf") if gain > 0 else 0.0

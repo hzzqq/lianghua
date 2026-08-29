@@ -382,11 +382,16 @@ def factor_portfolio(factor_panel, top: float = 0.2) -> pd.Series:
 
 def factor_decay_halflife(ic_decay) -> float:
     """因子 IC 衰减半衰期：由 IC 衰减序列（按 lag 索引）对数拟合估计。
-    返回半衰期（期数）；不衰减返回 inf。"""
-    s = pd.Series(ic_decay).astype(float)
-    s = s[s.abs() > 1e-9]
+
+    返回半衰期（期数）。两种特殊取值：
+    - ``inf``：拟合斜率为非负，即 IC 不衰减（真实信号）。
+    - ``nan``：有效点不足 2 个（全零 / 全 NaN / 序列过短），属「无信息」。
+      此处刻意不用 inf——inf 会被下游误读为「永不衰减」并污染排序与比较。
+    """
+    s = pd.Series(ic_decay).astype(float).replace([np.inf, -np.inf], np.nan)
+    s = s[s.abs().fillna(0.0) > 1e-9]
     if len(s) < 2:
-        return float("inf")
+        return float("nan")
     x = np.arange(len(s))
     y = np.log(s.abs().values + 1e-12)
     beta, *_ = np.polyfit(x, y, 1)
