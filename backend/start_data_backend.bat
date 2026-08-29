@@ -1,8 +1,12 @@
 @echo off
-chcp 65001 >nul
+rem Launcher for the real-data backend (backend/data_server.py).
+rem
+rem ASCII-only on purpose: `chcp 65001` together with multi-byte CJK text makes
+rem cmd.exe lose track of its byte offsets and garble the lines that follow.
+rem Reuses the same interpreter-picking logic as the project's run.bat.
+
 cd /d %~dp0
 
-rem 真实行情后端启动器：复用项目选 python 逻辑，再拉起 backend/data_server.py
 set "PY="
 if defined LIANGHUA_PYTHON if exist "%LIANGHUA_PYTHON%" set "PY=%LIANGHUA_PYTHON%"
 if not defined PY if exist "..\.venv\Scripts\python.exe" set "PY=..\.venv\Scripts\python.exe"
@@ -14,12 +18,15 @@ if not defined PY (
 )
 if not defined PY (
     echo [error] Python not found.
+    echo         Set LIANGHUA_PYTHON to your interpreter path.
     pause
     exit /b 1
 )
 
-echo Starting Lianghua 真实行情后端 (默认端口 8600) ...
+echo Starting Lianghua real-data backend (default port 8600) ...
+echo Ctrl+C to stop.
 "%PY%" data_server.py %*
+rem keep the real exit code: a bare "pause" would reset ERRORLEVEL to 0
 set "RC=%ERRORLEVEL%"
 pause
 exit /b %RC%
