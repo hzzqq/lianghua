@@ -78,6 +78,9 @@ streamlit run lianghua/ui/app.py
 # 或 python start.py / python -m lianghua / 双击 run.bat（中文名入口 启动量化终端.bat）/ 运行 ./run.sh
 ```
 
+**项目官网**：`site/index.html` —— 单文件、零依赖，双击即可离线打开。
+含终端界面演示、能力总览、可靠性工程说明与竞品对比。改版前先读下方「网站设计规范」。
+
 ## 内置策略
 
 - 股票/基金/期货通用：`sma_cross`(双均线) / `macd`(MACD) / `momentum`(动量) / `breakout`(通道突破) / `mean_reversion`(均值回归)
@@ -728,6 +731,28 @@ python tools/quickstart.py                                          # 全程向�
 全量回归 15 套：`test_reliability_audit`（833）/ `test_backtest_engine`+`_vectorized_polish`（16，需 `python -m pytest`）/
 `test_bat_sanity`（6）/ `test_service_lifecycle`（17）/ `test_platform`（UI 23 页无头渲染）/
 `test_live` 系列（27）/ 6 套历史迭代。
+
+## 网站设计规范（`site/index.html`）
+
+官网是**单文件 HTML + 手写 CSS，零外部依赖**（字体为可选 CDN，离线自动回退系统字体栈），
+双击即可打开。改版时请守住以下几条已定的设计决策：
+
+| 项 | 取值 | 为什么 |
+|---|---|---|
+| 落地页模板 | **Product Demo + Features** | Hero → 产品演示 → 功能拆解 → 对比 → CTA，正好装下终端演示与竞品对比 |
+| 风格 | Data-Dense Dashboard | 金融分析 / BI，贴量化调性 |
+| 背景 | `#020617` 近黑 | 与暗色交易终端一致 |
+| CTA 主色 | **蓝 `#3B82F6`** | 模板原给绿色 `#22C55E`，但 A 股语境下绿＝跌，作主按钮有认知冲突 |
+| 涨跌用色 | 涨 `#EF4444` 红 / 跌 `#22C55E` 绿 | A 股约定，与 CTA 蓝区分开 |
+| 成功/通过 | 青 `#06B6D4` | 避开与「跌绿」混淆 |
+| 灰阶 | `--text-dim #A1AEC1` / `--text-faint #8496AD` | 经对比度核算，全站最低 4.84:1，满足 WCAG AA |
+
+模板选型说明：`ui-ux-pro-max` 首推的是 **App Store Style Landing**，但那套需要应用商店
+下载按钮与二维码，而本项目是本地运行的 Python 框架、没有移动 App，故未采用。
+
+**改内容前先核对代码实际值**——官网上的策略数、优化器数、审计项数等全部取自注册表，
+不是手写的。口径提醒：`capabilities._PERF` 等的**顶层 15/17/6 是分组数**，
+展开后的**函数总数才是 57/51/26**，官网用的是后者。
 
 ## 许可证
 
