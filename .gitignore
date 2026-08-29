@@ -22,3 +22,8 @@ nul
 terminal.lock
 terminal.pid
 outputs/
+
+# 数据后端运行产物（pid / 日志）——勿提交
+backend.pid
+backend_runtime.log
+logs/

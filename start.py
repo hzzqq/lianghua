@@ -200,6 +200,63 @@ def _start_daemon(py: str, args) -> int:
     return 0
 
 
+def _ensure_backend(py: str, port: int = 8600, poll: float = 30) -> bool:
+    """「启动文件之后连接后端」：若真实行情后端未就绪，自动拉起后置服务。
+
+    - 用原始 TCP 探测 127.0.0.1:<port> 是否监听（不依赖 urllib，沙箱/代理环境更稳）；
+    - 未就绪则以脱离控制台的方式拉起 backend/data_server.py（随本机会话存活，
+      关闭启动窗口不影响）；
+    - 等待最多 15s 直到端口可连；超时也不阻塞终端启动（终端会以降级模式运行）。
+    返回 True 表示后端最终可用。
+    """
+    def _port_open() -> bool:
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(1.0)
+                return s.connect_ex(("127.0.0.1", port)) == 0
+        except OSError:
+            return False
+
+    if _port_open():
+        print(f"✅ 真实行情后端已在线 (http://localhost:{port})")
+        return True
+
+    log_dir = os.path.join(ROOT, "logs")
+    os.makedirs(log_dir, exist_ok=True)
+    logf = open(os.path.join(log_dir, "backend.log"), "a",
+                encoding="utf-8", errors="replace")
+    backend_py = os.path.join(ROOT, "backend", "data_server.py")
+    # --timeout 控制单次真实源取数超时：网络可达时 akshare/baostock 通常 <1s 返回，
+    # 断网/源不可达时快速降级演示（而非长时间卡死），避免慢源把终端取数请求拖超时。
+    cmd = [py, backend_py, "--live-poll", str(poll), "--port", str(port),
+           "--timeout", "5"]
+    kwargs: dict = {"stdin": subprocess.DEVNULL, "stdout": logf, "stderr": logf}
+    if os.name == "nt":
+        kwargs["creationflags"] = (
+            subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
+        )
+    else:
+        kwargs["start_new_session"] = True
+    try:
+        proc = subprocess.Popen(cmd, **kwargs)
+        with open(os.path.join(ROOT, "backend.pid"), "w", encoding="utf-8") as f:
+            f.write(str(proc.pid))
+        print(f"🚀 已自动拉起真实行情后端 (PID {proc.pid}) → http://localhost:{port}")
+    except Exception as e:
+        print(f"[警告] 后端自动拉起失败: {e}（终端将以降级模式运行）")
+        return False
+
+    deadline = time.time() + 15
+    while time.time() < deadline:
+        if _port_open():
+            print(f"✅ 真实行情后端就绪 (http://localhost:{port})")
+            return True
+        time.sleep(0.5)
+    print(f"[提示] 后端 15 秒内未就绪，终端仍以降级模式启动；"
+          f"稍后页面会展示真实连接状态。")
+    return False
+
+
 def main() -> int:
     # 启动器不该因为控制台编码（如 cp936 下输出 emoji）而崩掉
     for stream in (sys.stdout, sys.stderr):
@@ -229,6 +286,9 @@ def main() -> int:
               f"{os.path.join(ROOT, 'requirements.txt')}")
         print("  或直接用已装 streamlit 的解释器运行： <你的python> start.py")
         return 1
+
+    # 启动文件之后连接后端：终端启动前先确保真实行情后端在线
+    _ensure_backend(py)
 
     if _port_in_use(args.host, args.port):
         # 端口被占用：先判断是不是「我们自己」的 daemon 在跑。
