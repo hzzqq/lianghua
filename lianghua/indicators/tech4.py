@@ -60,21 +60,34 @@ def heikin_ashi(df) -> pd.DataFrame:
 
 
 def renko(df, brick: float | None = None) -> pd.Series:
-    """砖形趋势状态：价格每突破一个砖块翻转方向（1 多 / -1 空）。"""
+    """砖形趋势状态：价格每突破一个砖块翻转方向（1 多 / -1 空）。
+
+    brick 的取值决定是否存在前视偏差：
+    - 给定 brick：固定尺寸，无前视（推荐）。
+    - 缺省：改用**截至当前的历史极差**（expanding），而非全样本
+      ``close.max()-close.min()``——后者需要未来价格才能定尺寸，会让
+      基于该指标的回测系统性虚高。
+    """
     _require_cols(df, ["close"])
     close = df["close"].astype(float)
-    if brick is None or brick <= 0:
-        brick = float((close.max() - close.min()) / 50) or float(close.std() or 1.0)
+    if brick is not None and brick > 0:
+        sizes = pd.Series(float(brick), index=close.index)
+    else:
+        rng = (close.expanding().max() - close.expanding().min()) / 50
+        sizes = rng.where(rng > 0, close.expanding().std()).clip(lower=1e-6)
     last = float(close.iloc[0])
     direc = 0
     out = []
-    for p in close.values:
-        if p >= last + brick:
+    for p, b in zip(close.values, sizes.values):
+        b = float(b)
+        if not np.isfinite(b) or b <= 0:
+            b = 1e-6
+        if p >= last + b:
             direc = 1
-            last = last + brick
-        elif p <= last - brick:
+            last = last + b
+        elif p <= last - b:
             direc = -1
-            last = last - brick
+            last = last - b
         out.append(direc)
     return pd.Series(out, index=df.index, name="renko")
 

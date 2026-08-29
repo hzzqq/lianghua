@@ -453,6 +453,72 @@ def test_strategy_no_look_ahead(name):
     )
 
 
+# ------------------------------------------------------------------  指标前视自检
+_IND_FUNCS = {n: f for n, f in _FUZZ_FUNCS.items() if n.startswith("indicators.")}
+
+
+def _truncate_args(args, k):
+    return [
+        a.iloc[:k].reset_index(drop=True) if isinstance(a, (pd.Series, pd.DataFrame)) else a
+        for a in args
+    ]
+
+
+def _as_numeric(out):
+    """只关心逐时点的数值输出；标量/非数值返回 None（不参与前视判定）。"""
+    if isinstance(out, pd.Series):
+        return out.to_numpy(dtype=float, na_value=np.nan)
+    if isinstance(out, pd.DataFrame):
+        num = out.select_dtypes(include=[np.number])
+        return num.to_numpy(dtype=float, na_value=np.nan) if num.shape[1] else None
+    if isinstance(out, np.ndarray) and np.issubdtype(out.dtype, np.number):
+        return out.astype(float)
+    return None
+
+
+@pytest.mark.parametrize("fqn", sorted(_IND_FUNCS.keys()))
+def test_indicator_no_look_ahead(fqn):
+    """技术指标必须是「在线」的：截掉未来 K 线，历史取值不得改变。
+
+    口径说明（避免误伤）：
+    - 只检查 indicators 包。技术指标是策略的输入，逐时点输出，前视危害最大。
+    - 不检查 perf / risk 的汇总标量（annual_return、skew、VaR 等）——它们的
+      语义就是对整段样本做一次事后评价，截断后自然不同，不是前视。
+    - 不检查 factor 的横截面统计（zscore / winsorize / 分组收益等）——它们
+      在「行=日期、列=标的」的横截面上计算，与时间序列前视无关；
+      但若被误用于时间序列再回测，确实会引入前视，属用法纪律而非函数缺陷。
+    """
+    f = _IND_FUNCS[fqn]
+    fx = _fixtures()
+    k = 150
+    for args in _build_args(f, fx):
+        try:
+            full_out = f(*args)
+            trunc_out = f(*_truncate_args(args, k))
+        except Exception:  # noqa: BLE001
+            continue
+        a, b = _as_numeric(full_out), _as_numeric(trunc_out)
+        if a is None or b is None:
+            continue  # 标量/非数值指标不适用于前视判定
+        m = min(len(a), len(b), k)
+        if m == 0:
+            continue
+        A, B = a[:m], b[:m]
+        if A.ndim > 1:
+            A, B = A[:, 0], B[:, 0]
+        ok = ~(np.isnan(A) | np.isnan(B))
+        if ok.sum() == 0:
+            continue
+        diff = int((~np.isclose(A[ok], B[ok], rtol=1e-9, atol=1e-12)).sum())
+        if diff:
+            pytest.fail(
+                f"{fqn} 依赖未来数据：截掉后段 K 线后，前 {k} 个取值中有 {diff} 处改变 "
+                f"→ 前视偏差（常见成因：全样本 mean/std/max/min 定参数、shift(-1)）"
+            )
+        return
+    pytest.skip(f"{fqn} 无法用自动派发的输入形态驱动，未做前视判定")
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
 
