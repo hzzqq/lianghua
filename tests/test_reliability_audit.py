@@ -593,6 +593,100 @@ def test_sanity_result_shape():
         assert it["level"] in ("warn", "error")
 
 
+# ------------------------------------------------------------------  样本外验证
+from lianghua.backtest.validate import split_oos, out_of_sample_report  # noqa: E402
+
+
+def _trending_df(n: int = 400, growth: float = 0.001):
+    """确定性指数上涨序列（每期恒定百分比），让「买入并持有」必然盈利。
+
+    刻意用指数而非线性增长：线性上涨下前段与后段的**百分比**收益天然不同
+    （同样的绝对涨幅，基数小的时候百分比更大），会被误判成「收益衰减」。
+    指数增长保证两段的百分比收益口径一致，衰减率才反映策略本身。
+    """
+    close = 100.0 * (1.0 + growth) ** np.arange(n)
+    idx = pd.date_range("2020-01-01", periods=n, freq="B")
+    return pd.DataFrame(
+        {"open": close * 0.999, "high": close * 1.002,
+         "low": close * 0.998, "close": close},
+        index=idx,
+    )
+
+
+def _always_long(df: pd.DataFrame) -> pd.Series:
+    return pd.Series(1, index=df.index)
+
+
+def _len_aware_signal(df: pd.DataFrame) -> pd.Series:
+    """只在「长样本」（即样本内）做多，样本外空仓 —— 用于构造过拟合场景。
+
+    默认切分下样本内 240 根、样本外 160 根，阈值取 200 以区分两段。
+    """
+    return pd.Series(1 if len(df) > 200 else 0, index=df.index)
+
+
+def _boom(df: pd.DataFrame) -> pd.Series:
+    raise RuntimeError("故意失败，用于验证异常被兜住")
+
+
+def test_split_oos_is_chronological():
+    df = _trending_df(400)
+    tr, te = split_oos(df, 0.6)
+    assert len(tr) + len(te) == len(df)
+    assert tr.index.equals(df.index[: len(tr)])
+    assert te.index.equals(df.index[len(tr):])
+    # 金融数据不可随机打乱：切分必须严格按时间顺序
+    assert tr.index.max() < te.index.min()
+
+
+def test_split_oos_clamps_ratio():
+    df = _trending_df(400)
+    assert len(split_oos(df, 0.99)[0]) <= len(df) * 0.9 + 1
+    assert len(split_oos(df, 0.01)[0]) >= 1
+    assert len(split_oos(df, float("nan"))[0]) == int(len(df) * 0.6)
+
+
+def test_oos_unknown_on_short_sample():
+    rep = out_of_sample_report(_trending_df(40), _always_long)
+    assert rep["ok"] is False and rep["verdict"] == "unknown"
+    assert "不足" in rep["note"]
+
+
+def test_oos_unknown_on_signal_failure():
+    """信号函数抛异常时不得把异常抛给调用方。"""
+    rep = out_of_sample_report(_trending_df(400), _boom)
+    assert rep["ok"] is False and rep["verdict"] == "unknown"
+
+
+def test_oos_robust_when_edge_persists():
+    """单调上涨 + 全程做多：样本内外的优势都成立，应判稳健。"""
+    rep = out_of_sample_report(_trending_df(400), _always_long)
+    assert rep["ok"] is True
+    assert rep["verdict"] == "robust", rep["note"]
+    assert rep["in_sample"]["total_return"] > 0
+    assert rep["out_sample"]["total_return"] > 0
+
+
+def test_oos_overfit_when_edge_vanishes():
+    """样本内做多、样本外空仓：收益归零，必须判过拟合而非稳健。"""
+    rep = out_of_sample_report(_trending_df(400), _len_aware_signal)
+    assert rep["ok"] is True
+    assert rep["verdict"] == "overfit", rep["note"]
+    assert rep["in_sample"]["total_return"] > 0
+    assert rep["out_sample"]["total_return"] <= 0
+
+
+def test_oos_no_edge_when_in_sample_negative():
+    """样本内就没优势时，样本外数字无参考价值，不该去算衰减率。"""
+    df = _random_walk(n=600, seed=3)
+    rep = out_of_sample_report(df, get_strategy("sma_cross").generate_signals)
+    assert rep["ok"] is True
+    if rep["in_sample"]["total_return"] <= 0:
+        # 样本内没优势 → 不该去算衰减率（分母非正，衰减率无意义）
+        assert rep["decay"] is None
+        assert rep["verdict"] == "no_edge"
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
 
