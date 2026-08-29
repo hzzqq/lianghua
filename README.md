@@ -618,15 +618,36 @@ python tools/stop_services.py --keep-backend --json
 - `.bat` 正文保持**纯 ASCII**（与 `run.bat` 同一纪律），中文提示留在 Python 侧。
 - 陈旧 / 非法 pid 文件会被自动清理，避免下次启动时误杀无关进程。
 
+### 5.1 `.bat` 质量门禁（`tests/test_bat_sanity.py`）
+
+「含 chcp 就必须纯 ASCII」此前只写在 README 里，没人守——体检一上就抓到两个真实违规：
+`start_all.bat` 与 `backend\start_data_backend.bat` 同时含 `chcp 65001`、中文注释与 LF-only 换行，
+双击有实打实的启动失败风险。现已全部修为纯 ASCII + CRLF，并由测试锁死：
+
+| 检查项 | 规则 |
+|--------|------|
+| 编码 | 含 `chcp` 的 bat 必须纯 ASCII；不含 chcp 的也禁止非 ASCII（中文 Windows 默认 936，UTF-8 中文会乱码） |
+| 换行 | `.bat` 必须 CRLF（LF-only 会让 cmd 整行吞掉）；`.sh` 必须 LF（CRLF 会让 shebang 变成 `bash\r`） |
+| 引用 | bat 里写死的脚本路径必须真实存在 |
+| 冒烟 | 真实执行 `停止量化终端.bat --dry-run`，rc 必须为 0 |
+
+> **关于 bat 的端到端验证**：Bash / PowerShell 工具会拦截直接调用 `cmd.exe`
+> （"bypasses all command validation"），这属于**命令校验层**，与沙箱的网络白名单无关，
+> 加 `sandbox.network.allowedDomains` 也解决不了（当前 `denyAll: false`，网络本就放行）。
+> 但**从 Python 内部用 `subprocess` 调用 cmd 是可行的**，冒烟测试正是利用这一点，
+> 因此 bat 的语法 / 编码 / 选解释器逻辑都能被自动验证，无需人工双击。
+
 ### 6. 测试与验证
 
 - 新增 `tests/test_service_lifecycle.py`（**17 项**）：顺序不变量（supervisor 必须先于 terminal）、
   端口覆盖、`read_pid` 三态、`pid_alive`、`stop_pidfile`（陈旧清理 / dry-run 惰性 / 真实杀进程）、
   锁清理三态、`stop_all` 结构与 `--keep-backend`。
+- 新增 `tests/test_bat_sanity.py`（**6 项**）：`.bat` 编码 / 换行 / 引用静态体检 +
+  `停止量化终端.bat --dry-run` 端到端冒烟（借 Python subprocess 调 cmd，绕过工具层拦截）。
 - 端到端实测：起 supervisor → `:8510` 200 → 杀 streamlit 子进程 → **2s 内自愈**（`terminal.pid` 更新）→
   `stop_all()` → 等 8s 端口仍关闭（**自愈被成功阻断**）。
-- 全量回归 11 套通过：`test_service_lifecycle` / `test_platform`（UI 23 页无头渲染）/ `test_live` /
-  `test_live_advanced` / `test_live_exits` / 6 套历史迭代测试。
+- 全量回归 12 套通过：`test_bat_sanity` / `test_service_lifecycle` / `test_platform`（UI 23 页无头渲染）/
+  `test_live` / `test_live_advanced` / `test_live_exits` / 6 套历史迭代测试。
 - 一键启动：`start_all.bat` / `start_all.sh`（后端 8600 + 终端 8510）；对称停止：`stop_all.sh` / `停止量化终端.bat`。
 
 ## 许可证
