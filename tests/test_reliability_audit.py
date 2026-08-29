@@ -426,6 +426,33 @@ def test_missing_open_column_falls_back_to_close():
     assert res.stats()["look_ahead"] is False
 
 
+# ------------------------------------------------------------------  策略前视自检（未来扰动法）
+@pytest.mark.parametrize("name", STRATEGY_NAMES)
+def test_strategy_no_look_ahead(name):
+    """未来扰动法：把未来数据整个删掉，历史信号必须一字不变。
+
+    原理：若策略只用到 t 日及之前的数据，那么「完整的 n 根 K 线」与
+    「只截到 k 根」算出的前 k 个信号必然完全一致。一旦前半段信号发生变化，
+    就说明策略引用了尚未发生的未来数据（全样本均值/标准差、shift(-1)、
+    全局归一化等），回测收益会系统性虚高。
+
+    这是除引擎侧 execution_lag 之外的第二道防线：引擎保证「信号按时执行」，
+    本测试保证「信号本身不含未来」。
+    """
+    df = _random_walk(n=300, seed=11)
+    k = 200
+    gen = get_strategy(name)
+    full = np.asarray(gen.generate_signals(df))[:k]
+    trunc = np.asarray(gen.generate_signals(df.iloc[:k]))[:k]
+    m = min(len(full), len(trunc))
+    assert m > 0, f"{name} 在截断数据上未产生任何信号"
+    diff = int((full[:m] != trunc[:m]).sum())
+    assert diff == 0, (
+        f"{name} 的第 t 个信号依赖了 t 之后的数据：删掉未来 {len(df) - k} 根 K 线后，"
+        f"前 {k} 个信号中有 {diff} 处改变 → 前视偏差"
+    )
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
 
