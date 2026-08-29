@@ -531,6 +531,104 @@ print(payoff_curve(legs, 80, 120))
 - 全量回归 10 套 PASS：test_platform（UI 21 页）+ test_live + test_live_advanced + test_live_exits + 7 套历史测试；compileall 零错误。
 - 版本保持 `1.6.0-live`。
 
+## 第十五轮（真实行情后端 + 终端服务生命周期治理）
+
+把「数据从哪来」和「服务怎么停」两件一直被忽视的事做实：**新增真实行情后端**，
+并修掉一组让「停止终端」彻底失效的启动器缺陷。端口纪律：终端 **8510**、数据后端 **8600**（均避开 8501）。
+
+### 1. 真实行情数据后端（`backend/data_server.py`）
+
+用标准库 `http.server` 给现有 `DataGateway` 包一层 HTTP 接口，**零新增依赖**（坚守核心零重依赖纪律）。
+
+| 路由 | 作用 |
+|------|------|
+| `GET /api/health` | 探针（**零 I/O**，只回内存态，稳定 <0.1s） |
+| `GET /api/history?symbol=` | 历史 OHLCV（真实源 + SQLite 缓存，可 `force_refresh`） |
+| `GET /api/quote?symbol=` | 实时快照（含 `preclose` / `change` / `pct_change`） |
+| `GET /api/quote_batch?symbols=` | 批量快照 |
+| `GET /api/refresh?symbol=` | 强制回源刷新 |
+| `GET /api/cache` | 已落库清单（真实 vs 演示覆盖统计） |
+| `GET /api/stream?symbols=&interval=` | **SSE 推送**（`text/event-stream`），客户端断开即结束 |
+
+- 预热为默认行为（`--no-warm` 关闭）；`--live-poll N` 秒级刷新实时报价；
+  `--timeout` 控制死源降级等待（断网时快速降级而非卡死）。
+- **降级诚实可观测**：演示数据一律标 `source=demo` / `was_demo=true`，绝不冒充真实行情。
+- `backend/watchlist.json`：8 个预热标的，显式声明 `asset` 类型（ETF 标 `fund` 走 `fund_etf_hist_em`，避免误判降级）。
+- 启动：`python backend/data_server.py --live-poll 30`（端口 8600）；或 `backend/start_data_backend.bat|.sh`。
+
+### 2. 终端接入后端（`lianghua/ui/app.py`）
+
+- 接入层：`backend_online()` / `fetch_history_backend()` / `fetch_quote_backend()` /
+  `fetch_quote_batch_backend()` / `stream_quotes_snapshot()` / `backend_supports_sse()`。
+  **后端不可用一律返回 `None` 并回退本地网关**，绝不因后端宕机而白屏。
+- 自选实时面板改为一次批量取数；后端在线时展示「📡 实时推送已启用 · SSE」徽标，否则「🔄 轮询模式」。
+- `localhost` 归一化为 `127.0.0.1`：本沙箱 `socket.connect(("localhost", port))` 走 DNS 解析偶发超时，
+  导致终端误判后端离线。归一化后探针稳定。
+- `start.py` 的 `_ensure_backend()` 在启动终端前自动拉起后端（TCP 探测 + 超时 15s，失败也不阻塞终端）。
+
+### 3. UI 主题组件库（`lianghua/ui/theme.py`）
+
+自包含组件（配色全部内联，保证暗色可读）：`kpi_grid` / `section_header` / `card` /
+`chart_panel` / `badge` / `chip` / `source_badge` / `csv_export` / `sparkline` /
+`empty_state` / `back_to_home` / `auto_refresh` / `render_footer`。
+
+- 导航由扁平 radio 改为「模块分类 selectbox + 页面 radio」，新增**首页仪表盘**（能力 KPI 瓦片、快捷入口、数据健康区、交易时段徽标）。
+- **数据来源徽标体系**贯穿全站：真实绿 / 演示红 / 未知灰。K 线、自选面板、期权、套利、
+  蒙特卡洛、VaR 均标注来源，模型推导类（期权损益、MC、VaR）另加「📐 模型计算」说明，避免把模拟结果当行情。
+- 图表统一方向着色（**红涨绿跌**）+ 成交量副图 + range slider；多处支持 CSV 导出。
+
+### 4. 终端守护进程（`tools/terminal_supervisor.py`）
+
+- 背景：本沙箱在回合边界会回收后台启动 shell，streamlit 失去父 shell 即被杀（HTTP 000）。
+  常驻阻塞进程不会被回收。
+- 做法：阻塞循环 `Popen(streamlit)` → `wait()` → 退出后 2s 自动重启，自身作为常驻任务永不结束。
+- 实测：手动 `Stop-Process` 杀掉 streamlit，~9s 内 `:8510` 自动恢复 200。
+- 写 `supervisor.pid`（自身）+ 同步维护 `terminal.pid`（当前子进程），供停止脚本按序关停。
+
+### 5. 服务生命周期治理（`tools/stop_services.py`）
+
+停止逻辑从 `.bat` 迁入 Python：可单测、跨平台、绕开 cmd 编码坑。修掉 4 个真实缺陷：
+
+| # | 缺陷 | 后果 |
+|---|------|------|
+| A | supervisor 会在 streamlit 被杀后 2s 自愈，而停止脚本只杀 streamlit 子进程 | **终端永远停不掉** |
+| B | `.bat` 在 `for` 循环内用 `%PID%` 读刚 `set /p` 的值，缺 `EnableDelayedExpansion` → 展开为空 | `taskkill` 静默失效，pid 停止路径形同虚设 |
+| C | 停止脚本含 `chcp 65001` + 多字节中文 | cmd 按字节偏移解析失步（项目在 `run.bat` 上已踩过此坑） |
+| D | `start.py` 的 `_clear_lock()` 定义后从未调用 | 停止后 `terminal.lock` 残留脏状态 |
+
+关停顺序（**硬约束**，由测试锁死）：
+
+```
+1) supervisor.pid   ← 必须先杀，否则自愈重启
+2) terminal.pid     ← streamlit 子进程（未被托管时）
+3) backend.pid      ← 数据后端 :8600
+4) 端口兜底          ← 8501 / 8510 / 8600 上仍监听的残留
+5) 清理 terminal.lock（持有者已死才清，活着则保留以维持端口互斥语义）
+```
+
+用法：
+
+```bash
+python tools/stop_services.py              # 停止全部
+python tools/stop_services.py --dry-run    # 只报告将要做什么
+python tools/stop_services.py --keep-backend --json
+```
+
+- Windows 双击 `停止量化终端.bat`、Unix 用 `./stop_all.sh`，两者共用同一份 Python 逻辑。
+- `.bat` 正文保持**纯 ASCII**（与 `run.bat` 同一纪律），中文提示留在 Python 侧。
+- 陈旧 / 非法 pid 文件会被自动清理，避免下次启动时误杀无关进程。
+
+### 6. 测试与验证
+
+- 新增 `tests/test_service_lifecycle.py`（**17 项**）：顺序不变量（supervisor 必须先于 terminal）、
+  端口覆盖、`read_pid` 三态、`pid_alive`、`stop_pidfile`（陈旧清理 / dry-run 惰性 / 真实杀进程）、
+  锁清理三态、`stop_all` 结构与 `--keep-backend`。
+- 端到端实测：起 supervisor → `:8510` 200 → 杀 streamlit 子进程 → **2s 内自愈**（`terminal.pid` 更新）→
+  `stop_all()` → 等 8s 端口仍关闭（**自愈被成功阻断**）。
+- 全量回归 11 套通过：`test_service_lifecycle` / `test_platform`（UI 23 页无头渲染）/ `test_live` /
+  `test_live_advanced` / `test_live_exits` / 6 套历史迭代测试。
+- 一键启动：`start_all.bat` / `start_all.sh`（后端 8600 + 终端 8510）；对称停止：`stop_all.sh` / `停止量化终端.bat`。
+
 ## 许可证
 
 MIT
