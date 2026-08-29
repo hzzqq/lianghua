@@ -47,6 +47,12 @@ UI(Streamlit, 多资产切换) → 策略 → 统一回测调度器(runner) → 
 
 ## 快速开始
 
+**零基础？先看 [`QUICKSTART.md`](QUICKSTART.md)** —— 一条命令跑完回测，并告诉你结果可不可信：
+
+```bash
+python tools/quickstart.py --demo   # 用演示数据，断网也能跑
+```
+
 ```bash
 pip install -r requirements.txt
 
@@ -649,6 +655,79 @@ python tools/stop_services.py --keep-backend --json
 - 全量回归 12 套通过：`test_bat_sanity` / `test_service_lifecycle` / `test_platform`（UI 23 页无头渲染）/
   `test_live` / `test_live_advanced` / `test_live_exits` / 6 套历史迭代测试。
 - 一键启动：`start_all.bat` / `start_all.sh`（后端 8600 + 终端 8510）；对称停止：`stop_all.sh` / `停止量化终端.bat`。
+
+## 第十六轮（量化方法可靠性大审计 + 小白上手）
+
+针对「回测好看、实盘亏钱」这一根本疑虑，对全量量化方法做了一轮对抗性审计，
+10 轮迭代逐项修复，并新增面向零基础用户的向导式入口。
+
+### 审计器：`tests/test_reliability_audit.py`（833 通过 / 138 跳过）
+
+| 类别 | 数量 | 断言 |
+|---|---|---|
+| 策略 | 40 | `generate_signals(df)` 输出有限且 ∈ {-1,0,1}（直接管仓位，越界触发错误杠杆） |
+| 优化器 | 28 | 权重有限、和≈1、非负；退化输入（协方差奇异/单资产/全零/含 NaN/极短）不崩 |
+| 指标/绩效/风险/因子 | ~200 | 按参数名自动派发正确输入形态，断言不崩、无 NaN（容忍前 25% 预热 NaN） |
+| 退化输入 | ~200 | 常数/全 NaN/极短/全零下**零容忍 inf 与崩溃**（NaN 允许，算不出是合理降级） |
+
+### 前视偏差：三道防线（本轮核心）
+
+| 防线 | 机制 | 覆盖 |
+|---|---|---|
+| 引擎时序 | `execution_lag=1` + `fill_price="open"`：t 日收盘出信号、t+1 开盘成交 | 全部回测 |
+| 策略自检 | 未来扰动法：截掉后段 K 线，前段信号必须一字不变 | 40 策略 |
+| 指标自检 | 同上口径 | 41 指标 |
+
+**实测证据**：构造「开盘时不可得」的作弊信号 `sign(close[t]-close[t-1])`，
+
+| 设置 | 总收益 | 最大回撤 | 判定 |
+|---|---|---|---|
+| `lag=0 + open`（开盘点前视） | **+643.94%** | 仅 0.74% | 完美的假象 |
+| `lag=1 + open`（正确） | -65.07% | — | 扣完成本后的合理结果 |
+
+虚假收益高达 **709 个百分点**。真实策略（sma_cross/bollinger/macd/momentum/mean_reversion）
+在新旧默认下差异仅 1~7%，说明它们本身不含前视，改动不扭曲既有结论。
+
+修掉的真实前视 3 处：`strategy/grid.py`（网格中枢取全样本均值）、
+`strategy/renko_trend.py` 与 `indicators/tech4.renko`（砖块尺寸取全样本 std/极差）——
+均改为 expanding 历史统计，用户显式传参时保持固定值（推荐用法，无前视）。
+
+### 结果可信度
+
+- `BacktestResult.sanity()`：自动标记不可信结果。error 级（权益含 NaN/inf、权益为空）；
+  warn 级（样本<60、交易<10、信号全程同一取值、零成本、前视执行、夏普>3、
+  收益>50% 但回撤<2%、年化>100%）。返回 `{ok, level, issues}`，UI 可直接渲染。
+- `lianghua/backtest/validate.py`：样本外验证。按时间切分（不 shuffling），
+  输出样本内/样本外收益、衰减率与判定：`robust` / `degraded` / `overfit` / `no_edge` / `unknown`。
+  随机游走上 5 个经典策略全判 `no_edge`——随机游走本就没有 alpha，是正确结论。
+
+### 小白上手
+
+```bash
+python tools/quickstart.py --demo                                   # 断网可跑
+python tools/quickstart.py --symbol 600519.SH --strategy sma_cross  # 真实标的
+python tools/quickstart.py                                          # 全程向导
+```
+
+输出四块：回测结果、**可信度体检**、**样本外验证**、下一步建议。详见 [`QUICKSTART.md`](QUICKSTART.md)。
+
+### 其他修复
+
+- 7 个优化器退化输入下吐负权重/和≠1/归零 → `get_optimizer` 出口统一护栏（长仓截断+归一+退化等权）。
+- `omega_ratio` 常数输入返回 `inf` → 区分「真完美」与「无信息」（0.0）。
+- `factor_decay_halflife` 有效点<2 返回 `inf` → 改 `nan`，避免被误读为「永不衰减」。
+
+### 一个必须知道的语义
+
+`execution_lag=1` 下，**末尾 lag 个信号会被推出回测区间而不成交**。这是正确行为——
+信号 t 日收盘产生，只能在 t+1 执行；强行执行等于假设在产生瞬间成交，即前视偏差。
+想让最后一条指令生效，数据末尾多留一根 K 线即可（`exec_signals` 可查证）。
+
+### 测试
+
+全量回归 15 套：`test_reliability_audit`（833）/ `test_backtest_engine`+`_vectorized_polish`（16，需 `python -m pytest`）/
+`test_bat_sanity`（6）/ `test_service_lifecycle`（17）/ `test_platform`（UI 23 页无头渲染）/
+`test_live` 系列（27）/ 6 套历史迭代。
 
 ## 许可证
 
