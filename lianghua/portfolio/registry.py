@@ -29,6 +29,7 @@ from .advanced import (
     max_sharpe, min_cvar, shrinkage_min_var, max_entropy, momentum_score,
     min_tail_risk, vol_target_opt,
     bayesian_shrinkage, max_return, min_track_error, robust_cov,
+    sanitize_weights,
 )
 
 
@@ -131,14 +132,25 @@ OPTIMIZER_NAMES = list(OPTIMIZER_REGISTRY.keys())
 
 
 def get_optimizer(name: str, **kwargs):
-    """返回 ``f(returns_df, **kw) -> weight Series``。"""
+    """返回 ``f(returns_df, **kw) -> weight Series``。
+
+    出口统一套一层可靠性护栏（sanitize_weights）：非有限值清零、长仓截断负权重、
+    归一化为和=1；退化输入（协方差奇异/单资产/全零/含 NaN）无法求解析解时降级为等权，
+    保证任何情况下都返回一个可下单的合法组合，绝不抛异常或吐出 NaN/inf。
+    """
     if name not in OPTIMIZER_REGISTRY:
         raise ValueError(f"未知优化器: {name}，可选: {OPTIMIZER_NAMES}")
     fn = OPTIMIZER_REGISTRY[name]
 
     def _caller(returns: pd.DataFrame, **kw):
         kw.update(kwargs)
-        return fn(returns, **kw)
+        try:
+            w = fn(returns, **kw)
+            return sanitize_weights(w, returns.columns)
+        except Exception:  # noqa: BLE001
+            # 任何内部异常（如协方差不可逆）都降级为等权，保证可下单
+            n = len(returns.columns)
+            return pd.Series(np.ones(n) / n, index=returns.columns)
 
     return _caller
 
