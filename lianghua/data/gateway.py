@@ -60,6 +60,7 @@ class DataGateway:
         """
         con = sqlite3.connect(self.cache_db)
         try:
+            con.execute("PRAGMA busy_timeout=10000")  # 等待而非立即报 database is locked
             with con:
                 yield con
         finally:
@@ -124,6 +125,13 @@ class DataGateway:
             df = df.copy()
             df["symbol"] = symbol
             df["source"] = source
+            # 写库前统一为原生 python 类型：pandas 的 StringDtype / nullable 类型
+            # 无法被 sqlite3 适配器识别，to_sql 会抛 "Execution failed"。
+            for c in df.columns:
+                # pandas 的 StringDtype（含 'string' / 'string[python]' 等）无法被 sqlite3
+                # 适配器识别，to_sql 会抛 DatabaseError: Execution failed。统一转成原生 str。
+                if "string" in str(df[c].dtype):
+                    df[c] = df[c].astype(str)
             table = "option_bars" if asset == AssetType.OPTION else "bars"
             # 本次覆盖区间 = 向真实源问到的窗口 ∪ 实际拿回的数据首尾。
             # 请求窗口本身就是"已问过"的范围，哪怕其中某些日子没有行（休市），
@@ -164,6 +172,20 @@ class DataGateway:
                     # 与已有区间之间存在缺口（或本次没有区间信息）：整块替换。
                     # 保留缺口数据会让 cache_range 谎称覆盖了从未拉取过的日期。
                     con.execute(f"DELETE FROM {table} WHERE symbol=?", (symbol,))
+                # 写入前先删掉本批要落库的每一个交易日，杜绝主键 (symbol,date) 冲突：
+                # 腾讯分页翻页时首尾日期会重叠产生重复行，撞上缓存中已有的历史行会抛
+                # UNIQUE constraint failed -> to_sql 的 "Execution failed"。逐日期删除
+                # 最稳，无论冲突来自分页重复还是旧缓存残留。
+                dates = [str(d) for d in df["date"].tolist()]
+                if dates:
+                    ph = ",".join("?" for _ in dates)
+                    con.execute(
+                        f"DELETE FROM {table} WHERE symbol=? AND date IN ({ph})",
+                        (symbol, *dates),
+                    )
+                # 去重防御：腾讯分页翻页首尾日期重叠、或数据源返回重复行时，
+                # 同一批内会出现重复 (symbol,date)，to_sql 会自冲突抛 Execution failed。
+                df = df.drop_duplicates(subset=["date"]).reset_index(drop=True)
                 df.to_sql(table, con, if_exists="append", index=False)
                 if lo:
                     con.execute(
@@ -514,6 +536,18 @@ class DataGateway:
             })
         return pd.DataFrame(rows)
 
+    # ---------- 数据源：腾讯行情（零依赖 urllib，AKShare/BaoStock 不可用时兜底真实源） ----------
+    def _from_tencent(self, symbol: str, start: str, end: str, asset: AssetType) -> pd.DataFrame | None:
+        try:
+            from . import tencent as _tx
+        except Exception:
+            return None
+        try:
+            # 腾讯仅支持场内品种（股票/ETF/指数/可转债），场外基金(.OF)无行情会返回 None
+            return _tx.fetch_daily(symbol, start, end, asset=str(asset))
+        except Exception:
+            return None
+
     def _demo_data(self, symbol: str, start: str, end: str, asset: AssetType) -> pd.DataFrame:
         if asset == AssetType.FUND:
             return self._demo_fund(symbol, start, end)
@@ -567,7 +601,16 @@ class DataGateway:
             df = self._try_source(self._from_akshare, timeout, retries, backoff,
                                   symbol, start, end, at)
             src = "akshare" if df is not None else None
-        # 股票额外尝试 BaoStock
+        # 腾讯行情兜底真实源：覆盖 A股/ETF/指数（零依赖，多数受限网络仍可达），
+        # 放在 AKShare 之后、BaoStock 之前——股票/ETF/指数优先走腾讯真源，既能拿到
+        # 真实行情，又能避免 BaoStock 在受限网络下登录后卡 10s。彻底解决「真实行情
+        # 取不到 → 静默降级演示数据 → 回测建立在随机游走上」的效果崩塌。
+        # 期权腾讯无公开行情，跳过（由期权专用逻辑处理）。
+        if df is None and at != AssetType.OPTION:
+            df = self._try_source(self._from_tencent, timeout, retries, backoff,
+                                  symbol, start, end, at)
+            src = "tencent" if df is not None else None
+        # 股票额外尝试 BaoStock（支持腾讯未覆盖的品种，作为补充真实源）
         if df is None and at == AssetType.STOCK:
             df = self._try_source(self._from_baostock, timeout, retries, backoff,
                                   symbol, start, end)
@@ -815,6 +858,16 @@ class DataGateway:
                         "source": "akshare"}
         except Exception as exc:  # noqa: BLE001 - 实时源不可用是常态，降级到日线收盘
             self._note_error(f"live_quote({symbol}) 实时源", exc)
+        # 腾讯实时快照兜底：AKShare 实时源不可用时，单只快照仍可拿到真实报价
+        # （腾讯接口在 AKShare 东财被墙的受限网络下依然稳定），避免直接降到假数据。
+        try:
+            from . import tencent as _tx
+            px = _tx.fetch_quote(symbol)
+            if px is not None:
+                self.last_source, self.last_was_demo = "tencent", False
+                return {"symbol": symbol, "price": px, "source": "tencent"}
+        except Exception as exc:  # noqa: BLE001
+            self._note_error(f"live_quote({symbol}) 腾讯实时", exc)
         # 降级：最近日线收盘
         end = pd.Timestamp.now().strftime("%Y-%m-%d")
         start = (pd.Timestamp.now() - pd.Timedelta(days=10)).strftime("%Y-%m-%d")

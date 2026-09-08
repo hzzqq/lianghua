@@ -215,6 +215,16 @@ def run_once(symbol: str | None, strategy: str, start: str, end: str,
 
     sn = res.sanity()
     rep = out_of_sample_report(df, get_strategy(strategy).generate_signals)
+
+    # 买入持有基准：让用户一眼看出「策略到底有没有跑赢大盘」，
+    # 否则光看策略收益容易被误导（尤其 A股震荡市里多数策略跑输基准）。
+    if "close" in df.columns and len(df) > 1:
+        bh = float(df["close"].iloc[-1]) / float(df["close"].iloc[0]) - 1.0
+        excess = float(st["total_return"]) - bh
+        print()
+        print(f"  买入持有基准  {_fmt_pct(bh)}   （同一段行情什么也不做）")
+        tag = "跑赢基准" if excess > 0 else "跑输基准"
+        print(f"  策略超额收益  {_fmt_pct(excess)}   —— {tag}")
     _print_sanity(sn)
     _print_oos(rep)
     _next_steps(res, sn, rep)

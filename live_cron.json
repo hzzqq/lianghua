@@ -1,5 +1,6 @@
 {
-  "symbols": ["600519.SH", "000300.SH", "IF.CFE"],
+  "symbols": ["600519.SH", "510300.SH", "IF.CFE"],
+  "data_sanity": {"demo_refuse_ratio": 0.34, "lookback_days": 30},
   "routes": {
     "by_asset": {"stock": "paper_stock", "fund": "paper_stock", "future": "paper_future"},
     "by_prefix": {},

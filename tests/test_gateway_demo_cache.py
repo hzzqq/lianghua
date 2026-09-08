@@ -55,6 +55,8 @@ def test_demo_is_not_persisted(gw):
         ConnectionError("down"))
     gw._from_baostock = lambda symbol, start, end: (_ for _ in ()).throw(
         ConnectionError("down"))
+    gw._from_tencent = lambda *a, **k: (_ for _ in ()).throw(
+        ConnectionError("down"))  # 腾讯兜底真实源在本沙箱可达，必须一并禁用才能触发演示降级
 
     df = gw.fetch("600000.SH", "2024-01-01", "2024-01-10", asset="stock")
     assert gw.last_was_demo

@@ -32,8 +32,8 @@ def test_fetch_demo_stock_columns_and_source(gw):
     for c in ["date", "open", "high", "low", "close", "volume", "source"]:
         assert c in df.columns
     assert not df.empty
-    # 离线（无 akshare）应降级到 demo，但仍标注来源可追溯
-    assert df["source"].iloc[0] in {"demo", "csv", "akshare", "baostock"}
+    # 来源可追溯到真实源或演示源（腾讯行情已接入兜底真实源，故一并纳入合法集合）
+    assert df["source"].iloc[0] in {"demo", "csv", "akshare", "baostock", "tencent"}
 
 
 def test_fetch_invalid_date_range_raises(gw):
