@@ -758,3 +758,23 @@ python tools/quickstart.py                                          # 全程向�
 
 MIT
 
+---
+
+## 🏗️ 架构
+
+```mermaid
+flowchart TB
+    CFG[配置 YAML] --> GW[DataGateway<br/>多源降级 / 来源追溯]
+    GW --> A[assets 资产识别<br/>股 / 基 / 期 / 权]
+    A --> STR[40 策略库]
+    STR --> OPT[28 优化器]
+    OPT --> BT[回测引擎<br/>反前视偏差三道防线 · IC/ICIR · walk-forward]
+    BT --> EVAL[样本外评估<br/>robust / degraded / overfit / no_edge]
+    EVAL -->|上线| LE[LiveEngine 实盘]
+    LE --> ADAPT[QMT / PTrade 柜台适配器]
+    LE --> PAPER[paper 模式 · 定时调仓演练]
+    GW -. demo 占比超阈值拒启动 .-> LE
+```
+
+> 设计要点：**数据源信任链**——每条行情标注 `akshare/demo/last_close/synthetic` 来源，demo 占比超阈值门禁直接拒绝启动，杜绝"用假数据跑出假结论"；实盘须显式 `live=True` 才接真实资金（双保险）。
+
