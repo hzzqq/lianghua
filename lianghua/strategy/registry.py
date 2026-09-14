@@ -246,7 +246,9 @@ def _build_fn_registry():
     }
     for name, (kind, cn, short, detail) in _FN_SPECS.items():
         fn = fn_map[name]
-        reg[name] = lambda fn=fn, kind=kind, desc=short: FnStrategy(fn, kind, desc)
+        # 注意：lambda 必须转发 **kw 到 FnStrategy，否则 get_strategy(name, period=...)
+        # 传入的参数会被静默丢弃（甚至崩溃）。FnStrategy 会把 kw 发给底层策略函数。
+        reg[name] = lambda fn=fn, kind=kind, desc=short, **kw: FnStrategy(fn, kind, desc, **kw)
         info[name] = short
         cn_map[name] = cn
         detail_map[name] = detail
