@@ -1,6 +1,7 @@
 """特征存储：滚动特征计算并缓存到 SQLite。"""
 from __future__ import annotations
 
+import contextlib
 import sqlite3
 
 import numpy as np
@@ -18,8 +19,9 @@ _SCHEMA = (
 class FeatureStore:
     def __init__(self, db: str = "features.db"):
         self.db = db
-        with sqlite3.connect(self.db) as con:
+        with contextlib.closing(sqlite3.connect(self.db)) as con:
             con.execute(_SCHEMA)
+            con.commit()
 
     def add(self, symbol: str, df: pd.DataFrame, names: list):
         """df 需含 date 列与 names 指定的特征列；写入库。
@@ -51,13 +53,14 @@ class FeatureStore:
                 if not np.isfinite(fv):
                     raise ValueError(f"特征 {nm} 在 {dt} 为非有限值(NaN/inf)，拒绝写入")
                 rows.append((symbol, dt, nm, fv))
-        with sqlite3.connect(self.db) as con:
+        with contextlib.closing(sqlite3.connect(self.db)) as con:
             con.executemany(
                 "INSERT OR REPLACE INTO feat VALUES (?,?,?,?)", rows
             )
+            con.commit()
 
     def get(self, symbol: str, name: str) -> pd.Series:
-        with sqlite3.connect(self.db) as con:
+        with contextlib.closing(sqlite3.connect(self.db)) as con:
             d = pd.read_sql_query(
                 "SELECT date,value FROM feat WHERE symbol=? AND name=? ORDER BY date",
                 con, params=(symbol, name),
@@ -68,7 +71,7 @@ class FeatureStore:
 
     def get_features(self, symbol: str, names: list | None = None) -> pd.DataFrame:
         """一次性取出多特征，按 date 对齐成面板 DataFrame（列为各特征名）。"""
-        with sqlite3.connect(self.db) as con:
+        with contextlib.closing(sqlite3.connect(self.db)) as con:
             if names:
                 if len(names) == 0:
                     return pd.DataFrame()
@@ -85,7 +88,7 @@ class FeatureStore:
 
     def has(self, symbol: str, name: str) -> bool:
         """该 symbol 的该特征是否已缓存（可观测性）。"""
-        with sqlite3.connect(self.db) as con:
+        with contextlib.closing(sqlite3.connect(self.db)) as con:
             row = con.execute(
                 "SELECT 1 FROM feat WHERE symbol=? AND name=? LIMIT 1",
                 (symbol, name),
@@ -117,7 +120,7 @@ class FeatureStore:
         - 指定 symbol：``{feature_name: date_count}`` 便于排查特征缺失。
         查询失败（如表不存在）返回空 dict 而非抛错，保证内省不阻断主流程。
         """
-        with sqlite3.connect(self.db) as con:
+        with contextlib.closing(sqlite3.connect(self.db)) as con:
             if symbol is None:
                 rows = con.execute(
                     "SELECT symbol, COUNT(DISTINCT name), COUNT(DISTINCT date), "
@@ -132,8 +135,9 @@ class FeatureStore:
 
     def purge(self, symbol: str | None = None):
         """清空缓存：symbol 为 None 时清空全部。"""
-        with sqlite3.connect(self.db) as con:
+        with contextlib.closing(sqlite3.connect(self.db)) as con:
             if symbol is None:
                 con.execute("DELETE FROM feat")
             else:
                 con.execute("DELETE FROM feat WHERE symbol=?", (symbol,))
+            con.commit()
