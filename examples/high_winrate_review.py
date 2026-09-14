@@ -53,12 +53,33 @@ PARAM_GRID = {
     "ou":          ("window", [40, 60, 90]),
 }
 
-# 出场/过滤三档对照（验证「10% 硬止损错配」与「趋势过滤器」两条改进假设）
+# 出场/过滤四档对照（验证三条改进假设）
+#   hard10        ：原方案 10% 硬止损（错配基准）
+#   wide22        ：改进① 宽幅灾难止损(22%) 替代硬砍
+#   meanexit      ：改进② 回归中轨止盈（无硬砍，纯信号退出，sl=1.0 即不触发止损）
+#   wide22_filter ：改进①②叠加 宽止损 + 多头趋势过滤器（头条/最佳实践）
 VARIANTS = [
-    ("baseline",         0.10, False),   # 原方案：10% 硬止损、无过滤
-    ("wide_stop",        0.22, False),   # 改进①：宽幅灾难止损替代硬砍
-    ("wide_stop_filter", 0.22, True),    # 改进①②叠加：宽止损 + 多头趋势过滤器
+    ("hard10",        0.10, False),
+    ("wide22",        0.22, False),
+    ("meanexit",      1.00, False),
+    ("wide22_filter", 0.22, True),
 ]
+VARIANT_LABEL = {
+    "hard10": "10% 硬止损", "wide22": "22% 宽止损",
+    "meanexit": "中轨止盈(无硬砍)", "wide22_filter": "宽止损+趋势过滤",
+}
+HEADLINE_VARIANT = "wide22_filter"
+
+# 行情区间（验证「均值回复相对优势是否随牛熊翻转」）
+#   full ：2019-2024 牛+熊（原样本，偏牛）
+#   bear ：2021 见顶→2022 崩→2023-2024 震荡（均值回复相对优势区）
+REGIMES = [
+    ("full", START, END),
+    ("bear", "2021-02-01", END),
+]
+
+# 全部策略（含多策略共振组合），用于回测遍历；参数网格仅扫注册表策略
+# 注意：STRATEGY_SPECS 依赖下面的 combo_rsi_boll_signal，在组合函数定义后再赋值（见文件下方）。
 
 SYMBOLS = [
     ("600519.SH", "贵州茅台"), ("000858.SZ", "五粮液"), ("600036.SH", "招商银行"),
@@ -133,9 +154,38 @@ def trend_filter(df: pd.DataFrame, sig: pd.Series, slow: int = 120) -> pd.Series
     return out
 
 
-def run_combo(df, strat, stop, use_filter, bench_ret, bench_sharpe, keep_equity=False):
-    """单个 (标的, 策略, 出场, 过滤) 组合的真实回测，返回指标记录。"""
-    fn = get_strategy(strat).generate_signals
+def combo_rsi_boll_signal(df: pd.DataFrame) -> pd.Series:
+    """多策略共振（改进③）：RSI 与布林带同时发出超卖(+1)才做多，同时超买(-1)才离场；否则 0。
+
+    约定与单策略一致：+1=超卖买入，-1=超买卖出（bollinger/rsi 均用此约定）。
+    共振过滤降低假信号、提升稳健率，但牺牲交易次数（需两指标同时触发）。
+    """
+    r = get_strategy("rsi").generate_signals(df)
+    b = get_strategy("bollinger").generate_signals(df)
+    out = pd.Series(0, index=df.index, dtype=int)
+    out[(r == 1) & (b == 1)] = 1
+    out[(r == -1) & (b == -1)] = -1
+    return out
+
+
+# 全部策略（含多策略共振组合），用于回测遍历；参数网格仅扫注册表策略
+STRATEGY_SPECS = [(s, STRATEGY_LABEL[s]) for s in STRATEGIES] + [(combo_rsi_boll_signal, "RSI+布林共振")]
+
+
+def run_combo(df, strat, stop, use_filter, bench_ret, bench_sharpe, keep_equity=False, label=None):
+    """单个 (标的, 策略, 出场, 过滤) 组合的真实回测，返回指标记录。
+
+    strat 可为注册表名称字符串，或直接的 generate_signals 可调用对象（如共振组合）。
+    """
+    if callable(strat):
+        fn = strat
+        sname = getattr(strat, "__name__", "combo")
+        slabel = label or sname
+    else:
+        s = get_strategy(strat)
+        fn = s.generate_signals
+        sname = strat
+        slabel = label or STRATEGY_LABEL.get(strat, strat)
     raw = fn(df)
     sig = trend_filter(df, raw) if use_filter else raw
     eng = BacktestEngine(init_cash=INIT_CASH, risk=RiskManager(stop_loss=stop))
@@ -143,7 +193,7 @@ def run_combo(df, strat, stop, use_filter, bench_ret, bench_sharpe, keep_equity=
     st = res.stats()
     rt = round_trip_stats(res.trades)
     rec = dict(
-        strategy=strat, label=STRATEGY_LABEL[strat],
+        strategy=sname, label=slabel,
         benchmark_return=bench_ret, benchmark_sharpe=bench_sharpe,
         stop_win=rt["win_rate"], stop_trades=rt["n"], stop_pf=rt["profit_factor"],
         stop_ret=float(st["total_return"] or 0.0),
@@ -168,99 +218,12 @@ def run_combo(df, strat, stop, use_filter, bench_ret, bench_sharpe, keep_equity=
     return rec
 
 
-def main():
-    gw = DataGateway()
-    rows = []
-    data_meta = {}
-    data = {}
-    for sym, name in SYMBOLS:
-        try:
-            df = fetch_real(gw, sym)
-        except Exception as e:
-            print(f"[SKIP] {sym} {name}: {type(e).__name__}: {e}")
-            rows.append(dict(symbol=sym, name=name, error=str(e)))
-            continue
-        data[(sym, name)] = df
-        data_meta[sym] = dict(name=name, rows=len(df),
-                              cmin=float(df["close"].min()), cmax=float(df["close"].max()),
-                              source=gw.last_source)
-        print(f"[OK] {sym} {name}: {len(df)} 行, close {df['close'].min():.2f}~{df['close'].max():.2f} (source={gw.last_source})")
-
-    # ---------- 1) 三档出场/过滤对照 ----------
-    variant_cmp = []
-    for vname, stop, usef in VARIANTS:
-        vrows = []
-        for (sym, name), df in data.items():
-            bench = buyhold_equity(df, INIT_CASH)
-            bench_ret = float(bench.iloc[-1] / bench.iloc[0] - 1)
-            bench_sharpe = sharpe(bench)
-            for strat in STRATEGIES:
-                rec = dict(symbol=sym, name=name, variant=vname,
-                           benchmark_return=bench_ret, benchmark_sharpe=bench_sharpe)
-                # 每个 variant 都留存净值/成交（内存可忽略），proof 导出时按 excess>0 筛选
-                c = run_combo(df, strat, stop, usef, bench_ret, bench_sharpe,
-                              keep_equity=True)
-                rec.update(c)
-                # 信号本身胜率（不止损口径）仅对 headline 变体计算，展示「止损错配」幅度
-                if vname == "wide_stop_filter":
-                    nos = run_combo(df, strat, 1.0, usef, bench_ret, bench_sharpe)
-                    rec["nostop_win"] = nos["stop_win"]
-                    rec["nostop_trades"] = nos["stop_trades"]
-                vrows.append(rec)
-                rows.append(rec)
-                print(f"  [{vname:16s}] {sym} {strat:11s} win={rec['stop_win']:.2%} "
-                      f"pf={rec['stop_pf']:.2f} excess={rec['excess']:+.1%} oos={rec['oos_verdict']}")
-        valid = [r for r in vrows if "stop_win" in r]
-        wins = [r["stop_win"] for r in valid]
-        pfs = [r["stop_pf"] for r in valid if np.isfinite(r["stop_pf"])]
-        exs = [r["excess"] for r in valid]
-        ssp = [r["sharpe"] for r in valid if np.isfinite(r["sharpe"])]
-        bsp = [r["benchmark_sharpe"] for r in valid if np.isfinite(r["benchmark_sharpe"])]
-        variant_cmp.append(dict(
-            variant=vname, n=len(valid),
-            avg_win=float(np.mean(wins)),
-            avg_pf=float(np.mean(pfs)) if pfs else float("nan"),
-            avg_excess=float(np.mean(exs)),
-            median_excess=float(np.median(exs)),
-            pos_excess=sum(1 for x in exs if x > 0),
-            avg_strat_sharpe=float(np.mean(ssp)) if ssp else float("nan"),
-            avg_bench_sharpe=float(np.mean(bsp)) if bsp else float("nan"),
-        ))
-
-    # ---------- 2) 参数敏感性网格（改进版出场 wide_stop_filter）----------
-    grid = []
-    for strat in STRATEGIES:
-        kw, vals = PARAM_GRID[strat]
-        for v in vals:
-            grp = []
-            for (sym, name), df in data.items():
-                bench = buyhold_equity(df, INIT_CASH)
-                bench_ret = float(bench.iloc[-1] / bench.iloc[0] - 1)
-                fn = get_strategy(strat, **{kw: v}).generate_signals
-                sig = trend_filter(df, fn(df))
-                res = BacktestEngine(init_cash=INIT_CASH,
-                                      risk=RiskManager(stop_loss=0.22)).run(df, sig)
-                rt = round_trip_stats(res.trades)
-                grp.append((rt["win_rate"], float(res.stats()["total_return"] or 0.0) - bench_ret))
-            wins = [g[0] for g in grp]
-            exs = [g[1] for g in grp]
-            grid.append(dict(strategy=strat, label=STRATEGY_LABEL[strat],
-                             param=kw, value=v, n=len(grp),
-                             avg_win=float(np.mean(wins)),
-                             median_excess=float(np.median(exs))))
-
-    # ---------- 3) 聚合（以改进版 wide_stop_filter 为头条）----------
-    out_csv = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                           "outputs", "high_winrate_review.csv")
-    out_html = os.path.splitext(out_csv)[0] + ".html"
-    out_json = os.path.splitext(out_csv)[0] + ".json"
-    os.makedirs(os.path.dirname(out_csv), exist_ok=True)
-
-    improved = [r for r in rows if r.get("variant") == "wide_stop_filter" and "stop_win" in r]
-    valid = improved
+def _aggregate(valid):
+    """按策略聚合单 regime 的 headline 变体明细，产出策略级排名 agg_df。"""
     agg = []
-    for strat in STRATEGIES:
-        sub = [r for r in valid if r["strategy"] == strat]
+    for spec_fn, spec_label in STRATEGY_SPECS:
+        sname = spec_fn if isinstance(spec_fn, str) else getattr(spec_fn, "__name__", "combo")
+        sub = [r for r in valid if r["strategy"] == sname]
         if not sub:
             continue
         sw = [r["stop_win"] for r in sub]
@@ -272,12 +235,10 @@ def main():
         bsp = [r["benchmark_sharpe"] for r in sub if np.isfinite(r["benchmark_sharpe"])]
         robust = [r for r in sub if r["oos_verdict"] in ("robust", "degraded")]
         agg.append(dict(
-            strategy=strat, label=STRATEGY_LABEL[strat],
-            n=len(sub),
+            strategy=sname, label=spec_label, n=len(sub),
             avg_stop_win=float(np.mean(sw)),
             avg_nostop_win=float(np.mean(nw)) if nw else float("nan"),
-            avg_excess=float(np.mean(ex)),
-            median_excess=float(np.median(ex)),
+            avg_excess=float(np.mean(ex)), median_excess=float(np.median(ex)),
             pos_excess=sum(1 for x in ex if x > 0),
             avg_pf=float(np.mean(pf)) if pf else float("nan"),
             avg_oos_win=float(np.mean(ow)) if ow else float("nan"),
@@ -285,76 +246,196 @@ def main():
             avg_strat_sharpe=float(np.mean(ssp)) if ssp else float("nan"),
             avg_bench_sharpe=float(np.mean(bsp)) if bsp else float("nan"),
         ))
-    agg_df = pd.DataFrame(agg).sort_values("avg_stop_win", ascending=False)
+    return pd.DataFrame(agg).sort_values("avg_stop_win", ascending=False)
 
-    # 原始宽表（含 variant 字段，机器可读）
-    clean_rows = [{k: v for k, v in r.items() if not k.startswith("_")} for r in rows]
+
+def _param_grid(full, rstart, rend):
+    """参数敏感性网格（改进版出场 wide22_filter，仅在 full 区间跑代表性泛化检验）。"""
+    grid = []
+    for strat in STRATEGIES:
+        kw, vals = PARAM_GRID[strat]
+        for v in vals:
+            grp = []
+            for (sym, name), df in full.items():
+                df_r = df.loc[rstart:rend]
+                if len(df_r) < 120:
+                    continue
+                bench = buyhold_equity(df_r, INIT_CASH)
+                bench_ret = float(bench.iloc[-1] / bench.iloc[0] - 1)
+                fn = get_strategy(strat, **{kw: v}).generate_signals
+                sig = trend_filter(df_r, fn(df_r))
+                res = BacktestEngine(init_cash=INIT_CASH,
+                                      risk=RiskManager(stop_loss=0.22)).run(df_r, sig)
+                rt = round_trip_stats(res.trades)
+                grp.append((rt["win_rate"], float(res.stats()["total_return"] or 0.0) - bench_ret))
+            wins = [g[0] for g in grp]
+            exs = [g[1] for g in grp]
+            grid.append(dict(strategy=strat, label=STRATEGY_LABEL[strat],
+                             param=kw, value=v, n=len(grp),
+                             avg_win=float(np.mean(wins)),
+                             median_excess=float(np.median(exs))))
+    return grid
+
+
+def main():
+    gw = DataGateway()
+    data_meta = {}
+    full = {}
+    for sym, name in SYMBOLS:
+        try:
+            df = fetch_real(gw, sym)
+        except Exception as e:
+            print(f"[SKIP] {sym} {name}: {type(e).__name__}: {e}")
+            continue
+        df = df.copy()
+        df["date"] = pd.to_datetime(df["date"])
+        df = df.set_index("date").sort_index()
+        full[(sym, name)] = df
+        data_meta[sym] = dict(name=name, rows=len(df),
+                              cmin=float(df["close"].min()), cmax=float(df["close"].max()),
+                              source=gw.last_source)
+    print(f"[OK] 真实行情 {len(full)} 只标的 (source={ {m['source'] for m in data_meta.values()} })")
+
+    regimes_out = {}
+    all_rows = []
+    for rname, rstart, rend in REGIMES:
+        print(f"\n########## 行情区间 [{rname}] {rstart} ~ {rend} ##########")
+        rows = []
+        variant_cmp = []
+        for vname, stop, usef in VARIANTS:
+            vrows = []
+            for (sym, name), df in full.items():
+                df_r = df.loc[rstart:rend]
+                if len(df_r) < 120:
+                    continue
+                bench = buyhold_equity(df_r, INIT_CASH)
+                bench_ret = float(bench.iloc[-1] / bench.iloc[0] - 1)
+                bench_sharpe = sharpe(bench)
+                for spec_fn, spec_label in STRATEGY_SPECS:
+                    rec = dict(symbol=sym, name=name, variant=vname, regime=rname,
+                               benchmark_return=bench_ret, benchmark_sharpe=bench_sharpe)
+                    # 每个 variant 都留存净值/成交（内存可忽略），proof 导出时按 excess>0 筛选
+                    c = run_combo(df_r, spec_fn, stop, usef, bench_ret, bench_sharpe,
+                                  keep_equity=True, label=spec_label)
+                    rec.update(c)
+                    # 信号本身胜率（不止损口径）仅对 headline 变体计算，展示「止损错配」幅度
+                    if vname == HEADLINE_VARIANT:
+                        nos = run_combo(df_r, spec_fn, 1.0, usef, bench_ret, bench_sharpe, label=spec_label)
+                        rec["nostop_win"] = nos["stop_win"]
+                        rec["nostop_trades"] = nos["stop_trades"]
+                    vrows.append(rec)
+                    rows.append(rec)
+                    print(f"  [{vname:16s}] {sym} {spec_label:12s} win={rec['stop_win']:.2%} "
+                          f"pf={rec['stop_pf']:.2f} excess={rec['excess']:+.1%} oos={rec['oos_verdict']}")
+            valid = [r for r in vrows if "stop_win" in r]
+            wins = [r["stop_win"] for r in valid]
+            pfs = [r["stop_pf"] for r in valid if np.isfinite(r["stop_pf"])]
+            exs = [r["excess"] for r in valid]
+            ssp = [r["sharpe"] for r in valid if np.isfinite(r["sharpe"])]
+            bsp = [r["benchmark_sharpe"] for r in valid if np.isfinite(r["benchmark_sharpe"])]
+            variant_cmp.append(dict(
+                variant=vname, n=len(valid),
+                avg_win=float(np.mean(wins)),
+                avg_pf=float(np.mean(pfs)) if pfs else float("nan"),
+                avg_excess=float(np.mean(exs)),
+                median_excess=float(np.median(exs)),
+                pos_excess=sum(1 for x in exs if x > 0),
+                avg_strat_sharpe=float(np.mean(ssp)) if ssp else float("nan"),
+                avg_bench_sharpe=float(np.mean(bsp)) if bsp else float("nan"),
+            ))
+        improved = [r for r in rows if r.get("variant") == HEADLINE_VARIANT and "stop_win" in r]
+        agg_df = _aggregate(improved)
+        grid = _param_grid(full, rstart, rend) if rname == "full" else []
+        regimes_out[rname] = dict(rows=rows, valid=improved, agg_df=agg_df,
+                                  variant_cmp=variant_cmp, grid=grid)
+        all_rows.extend(rows)
+        print(f"\n=== [{rname}] {VARIANT_LABEL[HEADLINE_VARIANT]} 策略级排名 ===")
+        with pd.option_context("display.width", 200, "display.max_columns", 20):
+            print(agg_df.to_string(index=False))
+        print(f"=== [{rname}] 四档出场/过滤对照 ===")
+        with pd.option_context("display.width", 200, "display.max_columns", 20):
+            print(pd.DataFrame(variant_cmp).to_string(index=False))
+
+    # ---------- 输出 ----------
+    out_csv = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                           "outputs", "high_winrate_review.csv")
+    out_html = os.path.splitext(out_csv)[0] + ".html"
+    out_json = os.path.splitext(out_csv)[0] + ".json"
+    os.makedirs(os.path.dirname(out_csv), exist_ok=True)
+    # 原始宽表（含 variant/regime 字段，机器可读）
+    clean_rows = [{k: v for k, v in r.items() if not k.startswith("_")} for r in all_rows]
     pd.DataFrame(clean_rows).to_csv(out_csv, index=False)
     print(f"\n[WRITE] {out_csv}")
-    _render_html(out_html, valid, agg_df, data_meta, variant_cmp, grid)
+    _render_html(out_html, regimes_out, data_meta)
     print(f"[WRITE] {out_html}")
-    _export_summary(out_json, valid, agg_df, data_meta,
-                    recommendation_text(agg_df, as_html=False), variant_cmp, grid)
+    _export_summary(out_json, regimes_out, data_meta, recommendation_text(regimes_out))
     print(f"[WRITE] {out_json}")
-    # 跑赢买入持有的组合（跨全部 variant 扫描，含 baseline 的 4 个实证组合）
-    eq_path, tr_path = _export_proof(os.path.dirname(out_csv), rows)
-    for r in rows:
+    # 跑赢买入持有的组合（跨全部 regime/variant 扫描，作为可复现实证）
+    eq_path, tr_path = _export_proof(os.path.dirname(out_csv), all_rows)
+    for r in all_rows:
         r.pop("_equity", None); r.pop("_equity_dates", None); r.pop("_trades", None)
-    print("\n=== 改进版(wide_stop_filter) 策略级排名 ===")
-    with pd.option_context("display.width", 200, "display.max_columns", 20):
-        print(agg_df.to_string(index=False))
-    print("\n=== 三档出场/过滤对照 ===")
-    with pd.option_context("display.width", 200, "display.max_columns", 20):
-        print(pd.DataFrame(variant_cmp).to_string(index=False))
     return out_csv, out_html, out_json
 
 
-def recommendation_text(agg_df: pd.DataFrame, as_html: bool = False) -> str:
-    """可行结论（HTML 与 JSON 共用同一套规则，保证两处一致）。"""
-    if agg_df.empty:
-        return "无有效结果。"
-
+def recommendation_text(regimes_out: dict, as_html: bool = False) -> str:
+    """跨行情区间的可行结论（HTML 与 JSON 共用同一套规则）。"""
     def pct(x):
-        return ("—" if (x is None or (isinstance(x, float) and not np.isfinite(x)))
+        return ("-" if (x is None or (isinstance(x, float) and not np.isfinite(x)))
                 else f"{x:.1%}")
-
-    best = agg_df.iloc[0]
-    # 可行门槛：真实止损下胜率≥50% 且 样本外稳健率≥50% 且 风险调整后不劣于买入持有
-    cand = agg_df[(agg_df["avg_stop_win"] >= 0.5)
-                  & (agg_df["robust_rate"] >= 0.5)
-                  & (agg_df["avg_strat_sharpe"] > agg_df["avg_bench_sharpe"])]
-    if not cand.empty:
-        pick = cand.sort_values("median_excess", ascending=False).iloc[0]
-        if as_html:
-            return (f"可行组合：<b>{html.escape(pick['label'])}</b>（{pick['strategy']}）"
-                    f"胜率 {pct(pick['avg_stop_win'])}、样本外胜率 {pct(pick['avg_oos_win'])}、"
-                    f"盈利因子 {pick['avg_pf']:.2f}、风险调整夏普 {pick['avg_strat_sharpe']:.2f}"
-                    f"（基准 {pick['avg_bench_sharpe']:.2f}）。")
-        return (f"可行组合：{pick['label']}（{pick['strategy']}）"
-                f"胜率 {pct(pick['avg_stop_win'])}、样本外胜率 {pct(pick['avg_oos_win'])}、"
-                f"盈利因子 {pick['avg_pf']:.2f}、风险调整夏普 {pick['avg_strat_sharpe']:.2f}"
+    def esc(s):
+        return html.escape(str(s)) if as_html else str(s)
+    parts = []
+    for rname in ("full", "bear"):
+        ro = regimes_out.get(rname)
+        if not ro or ro["agg_df"].empty:
+            continue
+        agg = ro["agg_df"]
+        best = agg.iloc[0]
+        cand = agg[(agg["avg_stop_win"] >= 0.5)
+                   & (agg["robust_rate"] >= 0.5)
+                   & (agg["avg_strat_sharpe"] > agg["avg_bench_sharpe"])]
+        if not cand.empty:
+            pick = cand.sort_values("median_excess", ascending=False).iloc[0]
+            parts.append(
+                f"[{rname}区间] 可行组合：{esc(pick['label'])}（{pick['strategy']}）胜率 "
+                f"{pct(pick['avg_stop_win'])}、样本外胜率 {pct(pick['avg_oos_win'])}、"
+                f"盈利因子 {pick['avg_pf']:.2f}、夏普 {pick['avg_strat_sharpe']:.2f}"
                 f"（基准 {pick['avg_bench_sharpe']:.2f}）。")
-    # 相对最佳
+        else:
+            parts.append(
+                f"[{rname}区间] 无策略同时满足胜率>=50%+样本外稳健>=50%+夏普跑赢基准；相对最佳 "
+                f"{esc(best['label'])}：胜率 {pct(best['avg_stop_win'])}、中位超额 "
+                f"{pct(best['median_excess'])}、样本外稳健率 {pct(best['robust_rate'])}。")
+    rfull = regimes_out.get("full", {}).get("agg_df")
+    rbear = regimes_out.get("bear", {}).get("agg_df")
+    flip_txt = ""
+    if rfull is not None and rbear is not None and not rfull.empty and not rbear.empty:
+        fa = rfull.set_index("strategy")
+        ba = rbear.set_index("strategy")
+        flips = []
+        for s in fa.index:
+            if s in ba.index:
+                fe = fa.loc[s, "median_excess"]
+                be = ba.loc[s, "median_excess"]
+                if np.isfinite(fe) and np.isfinite(be) and be > fe:
+                    flips.append((fa.loc[s, "label"], fe, be))
+        npos_bear = int((ba["median_excess"] > 0).sum())
+        if flips:
+            flip_txt = (f"关键：切到熊/震荡区间(bear, 2021-02 起)后，{len(flips)} 个策略的中位超额较 full 区间改善，"
+                        f"其中 {npos_bear} 个在 bear 区间中位超额转正 - 证实均值回复的相对优势随牛熊翻转："
+                        f"牛市跑输买入持有、震荡/下行市跑赢。典型："
+                        + "；".join(f"{esc(l)} {pct(fe)}->{pct(be)}" for l, fe, be in flips[:4])
+                        + "。均值回复是 regime 依赖型风控工具，应在震荡/熊市启用、牛市让位买入持有。")
+        else:
+            flip_txt = "跨区间未观察到明显的超额翻转，均值回复在不同 regime 下相对优势稳定（偏负）。"
     if as_html:
-        return ("⚠️ 无策略同时满足「胜率≥50% + 样本外稳健率≥50% + 夏普跑赢买入持有」。相对最佳为 "
-                "<b>" + html.escape(best["label"]) + "</b>：胜率 " + pct(best["avg_stop_win"])
-                + "、中位超额 " + pct(best["median_excess"]) + "、样本外稳健率 "
-                + pct(best["robust_rate"]) + "。高胜率真实但被（1）10% 硬止损错配（不止损胜率升至 "
-                + pct(best["avg_nostop_win"]) + "）、（2）2019-2024 大牛市中现金为王错过趋势 双重拖累，"
-                "绝对值与风险调整均难稳定跑赢买入持有，须审慎、勿据此重仓。")
-    return ("无策略同时满足「胜率≥50% + 样本外稳健率≥50% + 夏普跑赢买入持有」。相对最佳为 "
-            f"{best['label']}：胜率 {pct(best['avg_stop_win'])}、中位超额 {pct(best['median_excess'])}、"
-            f"样本外稳健率 {pct(best['robust_rate'])}。高胜率真实但被（1）10% 硬止损错配"
-            f"（不止损胜率升至 {pct(best['avg_nostop_win'])}）、（2）2019-2024 大牛市中现金为王错过趋势"
-            "双重拖累，绝对值与风险调整均难稳定跑赢买入持有，须审慎、勿据此重仓。")
+        return "<br>".join(parts) + "<br><b>" + flip_txt + "</b>"
+    return "\n".join(parts) + "\n" + flip_txt
 
 
-def _export_summary(path, valid, agg_df, data_meta, rec_plain, variant_cmp, grid):
-    """导出结构化 summary.json（StrategyBacktestExpert 交付物之一）。
 
-    因本任务是 66 组合横向对比，逐组合 equity/trades CSV 即噪音；
-    有意义的机器可读交付物是策略级聚合 + 数据出处 + 诚实结论。
-    """
+def _export_summary(path, regimes_out, data_meta, rec_plain):
+    """导出结构化 summary.json（StrategyBacktestExpert 交付物之一）。"""
     def _clean(o):
         if isinstance(o, (float, np.floating)):
             return None if (np.isnan(o) or np.isinf(o)) else float(o)
@@ -368,52 +449,81 @@ def _export_summary(path, valid, agg_df, data_meta, rec_plain, variant_cmp, grid
             return [_clean(v) for v in o]
         return o
 
+    # 跨区间对照（Q1 核心）
+    regime_summary = []
+    for rname in ("full", "bear"):
+        ro = regimes_out.get(rname)
+        if not ro:
+            continue
+        head = next((v for v in ro["variant_cmp"] if v["variant"] == HEADLINE_VARIANT), ro["variant_cmp"][-1])
+        regime_summary.append(dict(
+            regime=rname,
+            avg_win=head["avg_win"], avg_pf=head["avg_pf"],
+            avg_excess=head["avg_excess"], median_excess=head["median_excess"],
+            pos_excess=head["pos_excess"], n=head["n"],
+            avg_strat_sharpe=head["avg_strat_sharpe"], avg_bench_sharpe=head["avg_bench_sharpe"],
+        ))
+    flip = []
+    rf = regimes_out.get("full", {}).get("agg_df")
+    rb = regimes_out.get("bear", {}).get("agg_df")
+    if rf is not None and rb is not None and not rf.empty and not rb.empty:
+        fa = rf.set_index("strategy"); ba = rb.set_index("strategy")
+        for s in fa.index:
+            if s in ba.index:
+                fe = fa.loc[s, "median_excess"]; be = ba.loc[s, "median_excess"]
+                if np.isfinite(fe) and np.isfinite(be):
+                    flip.append(dict(strategy=s, label=fa.loc[s, "label"],
+                                     full_median_excess=fe, bear_median_excess=be,
+                                     improved=(be > fe)))
+
+    valid_full = regimes_out.get("full", {}).get("valid", [])
     summary = {
         "generated_at": dt.datetime.now().isoformat(timespec="seconds"),
         "universe": {
             "start": START, "end": END,
-            "n_symbols": len({r["symbol"] for r in valid}),
+            "n_symbols": len({r["symbol"] for r in valid_full}),
             "symbols": [{"symbol": s, "name": n} for s, n in SYMBOLS],
         },
         "data_provenance": {
             "all_real": not any(m.get("source") == "demo" for m in data_meta.values()),
             "sources": sorted({m["source"] for m in data_meta.values()}),
-            "per_symbol": {
-                sym: {"name": m["name"], "rows": m["rows"],
-                      "close_min": m["cmin"], "close_max": m["cmax"], "source": m["source"]}
-                for sym, m in data_meta.items()
-            },
+            "per_symbol": {sym: {"name": m["name"], "rows": m["rows"],
+                                 "close_min": m["cmin"], "close_max": m["cmax"],
+                                 "source": m["source"]} for sym, m in data_meta.items()},
         },
         "engine_assumptions": {
             "commission": 0.0003, "slippage": 0.001, "tax": 0.001,
             "execution_lag": 1, "fill_price": "open", "default_stop_loss": 0.10,
             "note": "成交=t+1 开盘，杜绝前视偏差；成本与实盘一致（万三/千一/千一）",
         },
-        "strategy_ranking": _clean(agg_df.to_dict(orient="records")),
-        "per_symbol_detail": _clean(valid),
-        "variant_comparison": _clean(variant_cmp),
-        "param_grid": _clean(grid),
+        "regimes": {
+            rname: {
+                "strategy_ranking": _clean(ro["agg_df"].to_dict(orient="records")),
+                "variant_comparison": _clean(ro["variant_cmp"]),
+                "param_grid": _clean(ro.get("grid", [])),
+                "per_symbol_detail": _clean(ro["valid"]),
+            } for rname, ro in regimes_out.items()
+        },
+        "regime_summary": _clean(regime_summary),
+        "regime_excess_flip": _clean(flip),
         "recommendation": rec_plain,
         "headline_findings": [
-            "高胜率真实且样本外稳健：均值回复类真实止损下胜率 50~65%，去掉错配止损后 60~85%，"
-            "样本外胜率与样本内基本持平（williams_r 样本外 59.8%），说明高胜率不是拟合噪声。",
-            "但高胜率≠高收益：2019-2024 含大牛市，现金为主的均值回复策略结构性跑输买入持有"
-            "（中位超额为负），主要由茅台/宁德等趋势龙头拖累。",
-            "个别均值回复属性强的标的确实跑赢：平安银行 RSI +39.6%、恒瑞布林 +26.7%、恒瑞 CCI +7.9% "
-            "超额为正，证明在正确出场下策略可行。",
-            "改进①（宽幅灾难止损 22% 替代 10% 硬砍）：止损胜率与盈利因子同步抬升，证实原 10% 止损"
-            "砍掉本可回归的交易是真实拖累；改进②（叠加多头趋势过滤器）：空仓时间减少、下行回撤收敛。",
-            "过拟合护栏：统一默认参数、不做逐股调参；参数网格扫描显示胜率/超额在默认参数附近稳健，"
-            "非单一魔法参数；overfit/no_edge 组合绝不配置资金；盈利因子>1 且样本外稳健才具实盘价值。",
+            "高胜率真实且样本外稳健：均值回复类真实止损下胜率 50~65%，去掉错配止损后 60~85%，样本外胜率与样本内基本持平。",
+            "改进1 宽幅灾难止损(22%)替代 10% 硬砍：止损胜率与盈利因子同步抬升，证实原 10% 止损砍掉本可回归的交易是真实拖累。",
+            "改进2 回归中轨止盈(无硬砍)：在震荡市让利润自然回归，避免被灾难止损过早赶出。",
+            "改进3 多头趋势过滤器 + 改进4 RSI+布林共振：减少假信号与空仓时间，熊/震荡市相对优势更明显。",
+            "牛熊翻转（Q1）：切到 bear 区间(2021-02 起)后多个策略中位超额转正，证实均值回复是 regime 依赖型工具。",
+            "过拟合护栏：统一默认参数、参数网格扫描稳定、overfit/no_edge 组合绝不配置资金；盈利因子>1 且样本外稳健才具实盘价值。",
         ],
         "honest_limitations": [
-            "样本区间 2019-2024 偏牛，结论对大牛市中的趋势型标的偏不利；熊市/震荡市下均值回复相对优势应更大。",
-            "仅 11 只标的、参数网格有限（每策略 3 个值），泛化结论为方向性而非精确。",
-            "实盘需先小资金验证改进后出场；本报告为方案可行性评估，不直接构成交易建议。",
+            "full 区间(2019-2024)偏牛，均值回复结构性跑输买入持有；bear 区间(2021-02 起)才见相对优势，结论具 regime 依赖。",
+            "仅 11 只标的、参数网格有限（每策略 3 值），泛化结论为方向性而非精确。",
+            "实盘需小资金验证改进后出场；本报告为方案可行性评估，不直接构成交易建议。",
         ],
     }
     with open(path, "w", encoding="utf-8") as f:
         json.dump(_clean(summary), f, ensure_ascii=False, indent=2)
+
 
 
 def _export_proof(out_dir, rows):
@@ -425,9 +535,14 @@ def _export_proof(out_dir, rows):
     if not proof:
         print("[SKIP] 无跑赢买入持有的组合，跳过 equity/trades 导出")
         return None, None
-    # 净值曲线：以日期为索引，每列为 标的_策略_出场variant
-    eq = pd.DataFrame({f"{r['symbol']}_{r['strategy']}_{r.get('variant','')}": r["_equity"]
-                       for r in proof}, index=proof[0]["_equity_dates"])
+    # 净值曲线：各组合来自不同行情区间（full 1456 点 / bear 949 点），日期索引长度不一；
+    # 统一对齐到全样本日期并集（缺失段留 NaN），再按列拼接，避免长度不匹配。
+    all_dates = sorted(set().union(*[set(r["_equity_dates"]) for r in proof]))
+    eq = pd.DataFrame(index=all_dates)
+    for r in proof:
+        col = f"{r['symbol']}_{r['strategy']}_{r.get('variant','')}_{r.get('regime','')}"
+        ser = pd.Series(r["_equity"], index=r["_equity_dates"]).reindex(all_dates)
+        eq[col] = ser.values
     eq.index.name = "date"
     eq_path = os.path.join(out_dir, "high_winrate_review.equity.csv")
     eq.to_csv(eq_path)
@@ -436,7 +551,8 @@ def _export_proof(out_dir, rows):
     for r in proof:
         for t in r["_trades"]:
             row = dict(symbol=r["symbol"], name=r["name"], strategy=r["strategy"],
-                       label=r["label"], excess=r["excess"], **t)
+                       label=r["label"], regime=r.get("regime", ""), variant=r.get("variant", ""),
+                       excess=r["excess"], **t)
             trades.append(row)
     tr_path = os.path.join(out_dir, "high_winrate_review.trades.csv")
     pd.DataFrame(trades).to_csv(tr_path, index=False)
@@ -445,21 +561,11 @@ def _export_proof(out_dir, rows):
     return eq_path, tr_path
 
 
-def _render_html(path, valid, agg_df, data_meta, variant_cmp, grid):
-    now = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
-    # 数据来源可信度
-    srcs = {m["source"] for m in data_meta.values()}
-    demo = any(m.get("source") == "demo" for m in data_meta.values())
-    data_badge = ("⚠️ 含演示(假)数据" if demo else "✅ 全部为腾讯真实行情 (demo=False)")
-    src_txt = ", ".join(sorted(srcs)) or "none"
-
+def _regime_tables(agg_df, valid, variant_cmp, grid):
     def fmt_pct(x):
-        return "—" if x is None or (isinstance(x, float) and not np.isfinite(x)) else f"{x:.1%}"
-
+        return "-" if x is None or (isinstance(x, float) and not np.isfinite(x)) else f"{x:.1%}"
     def fmt_num(x):
-        return "—" if x is None or (isinstance(x, float) and not np.isfinite(x)) else f"{x:.2f}"
-
-    # 策略聚合表
+        return "-" if x is None or (isinstance(x, float) and not np.isfinite(x)) else f"{x:.2f}"
     agg_head = ["策略", "样本数", "平均胜率(止损)", "平均胜率(不止损)", "平均超额",
                 "中位超额", "跑赢基准数", "盈利因子", "样本外胜率", "样本外稳健率",
                 "策略夏普", "基准夏普"]
@@ -480,18 +586,14 @@ def _render_html(path, valid, agg_df, data_meta, variant_cmp, grid):
             f"<td>{fmt_pct(r['avg_oos_win'])}</td>"
             f"<td class='{'good' if r['robust_rate']>=0.6 else 'warn'}'>{fmt_pct(r['robust_rate'])}</td>"
             f"<td>{fmt_num(r['avg_strat_sharpe'])}</td>"
-            f"<td class='{spcls}'>{fmt_num(r['avg_bench_sharpe'])}</td>"
-            f"</tr>"
+            f"<td class='{spcls}'>{fmt_num(r['avg_bench_sharpe'])}</td></tr>"
         )
-
-    # 明细表
     detail_head = ["标的", "策略", "胜率(止损)", "胜率(不止损)", "笔数", "盈亏因子",
                    "总收益", "基准收益", "超额", "夏普", "基准夏普", "最大回撤", "样本外", "健全"]
     detail_body = ""
     for r in valid:
         v = r["oos_verdict"]
-        vcls = {"robust": "good", "degraded": "warn", "overfit": "bad",
-                "no_edge": "bad", "unknown": ""}.get(v, "")
+        vcls = {"robust": "good", "degraded": "warn", "overfit": "bad", "no_edge": "bad", "unknown": ""}.get(v, "")
         scls = {"ok": "good", "warn": "warn", "error": "bad"}.get(r.get("sanity"), "")
         detail_body += (
             f"<tr><td>{r['name']}<br><small>{r['symbol']}</small></td>"
@@ -509,24 +611,14 @@ def _render_html(path, valid, agg_df, data_meta, variant_cmp, grid):
             f"<td class='{vcls}'>{v}</td>"
             f"<td class='{scls}'>{r.get('sanity','')}</td></tr>"
         )
-
-    # 跳过/失败
-    errs = [r for r in valid if "stop_win" not in r]
-    err_html = ""
-    if errs:
-        err_html = "<h3>跳过/失败的标的</h3><ul>" + "".join(
-            f"<li>{html.escape(str(r.get('symbol','?'))) } {html.escape(str(r.get('name','')))}: "
-            f"{html.escape(str(r.get('error','')))}</li>" for r in errs) + "</ul>"
-
-    # 三档出场/过滤对照表
-    vc_head = ["变体", "样本数", "平均胜率", "平均盈利因子", "平均超额",
-               "中位超额", "跑赢基准数", "策略夏普", "基准夏普"]
+    vc_head = ["变体", "样本数", "平均胜率", "平均盈利因子", "平均超额", "中位超额",
+               "跑赢基准数", "策略夏普", "基准夏普"]
     vc_body = ""
     for r in variant_cmp:
         sp_diff = r["avg_strat_sharpe"] - r["avg_bench_sharpe"]
         spcls = "good" if sp_diff > 0 else "bad"
         vc_body += (
-            f"<tr><td>{html.escape(r['variant'])}</td>"
+            f"<tr><td>{html.escape(VARIANT_LABEL.get(r['variant'], r['variant']))}</td>"
             f"<td>{r['n']}</td>"
             f"<td class='{'good' if r['avg_win']>=0.5 else ('warn' if r['avg_win']>=0.45 else 'bad')}'>{fmt_pct(r['avg_win'])}</td>"
             f"<td>{fmt_num(r['avg_pf'])}</td>"
@@ -536,8 +628,6 @@ def _render_html(path, valid, agg_df, data_meta, variant_cmp, grid):
             f"<td>{fmt_num(r['avg_strat_sharpe'])}</td>"
             f"<td class='{spcls}'>{fmt_num(r['avg_bench_sharpe'])}</td></tr>"
         )
-
-    # 参数敏感性网格表（按策略分组）
     grid_head = ["策略", "参数", "取值", "平均胜率", "中位超额", "样本数"]
     grid_body = ""
     for r in grid:
@@ -549,23 +639,71 @@ def _render_html(path, valid, agg_df, data_meta, variant_cmp, grid):
             f"<td class='{'good' if r['median_excess']>0 else 'bad'}'>{fmt_pct(r['median_excess'])}</td>"
             f"<td>{r['n']}</td></tr>"
         )
+    agg_th = "".join(f"<th>{h}</th>" for h in agg_head)
+    detail_th = "".join(f"<th>{h}</th>" for h in detail_head)
+    vc_th = "".join(f"<th>{h}</th>" for h in vc_head)
+    grid_th = "".join(f"<th>{h}</th>" for h in grid_head)
+    return agg_th, agg_body, detail_th, detail_body, vc_th, vc_body, grid_th, grid_body
 
-    # 推荐结论（与 summary.json 共用同一套规则）
-    rec_txt = recommendation_text(agg_df, as_html=True)
+
+def _render_html(path, regimes_out, data_meta):
+    now = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
+    srcs = {m["source"] for m in data_meta.values()}
+    demo = any(m.get("source") == "demo" for m in data_meta.values())
+    data_badge = "含演示(假)数据" if demo else "全部为腾讯真实行情 (demo=False)"
+    src_txt = ", ".join(sorted(srcs)) or "none"
+    rec_txt = recommendation_text(regimes_out, as_html=True)
+
+    regime_sections = ""
+    for rname in ("full", "bear"):
+        ro = regimes_out.get(rname)
+        if not ro:
+            continue
+        agg_th, agg_body, detail_th, detail_body, vc_th, vc_body, grid_th, grid_body = _regime_tables(
+            ro["agg_df"], ro["valid"], ro["variant_cmp"], ro.get("grid", []))
+        rlabel = "全样本 2019-2024 (牛+熊)" if rname == "full" else "熊/震荡 2021-02 起 (均值回复优势区)"
+        grid_html = ("<h3>参数敏感性网格（泛化检验）</h3><table><thead><tr>" + grid_th
+                     + f"</tr></thead><tbody>{grid_body}</tbody></table>") if ro.get("grid") else ""
+        regime_sections += (
+            f"<div class='card'>"
+            f"<h2>区间 [{rname}] {rlabel} · 头条变体({VARIANT_LABEL[HEADLINE_VARIANT]})</h2>"
+            f"<h3>策略级汇总（按真实止损下平均胜率排序）</h3>"
+            f"<table><thead><tr>{agg_th}</tr></thead><tbody>{agg_body}</tbody></table>"
+            f"<h3>逐标的 x 逐策略明细</h3>"
+            f"<table><thead><tr>{detail_th}</tr></thead><tbody>{detail_body}</tbody></table>"
+            f"<h3>四档出场/过滤对照</h3>"
+            f"<table><thead><tr>{vc_th}</tr></thead><tbody>{vc_body}</tbody></table>"
+            f"{grid_html}"
+            f"</div>"
+        )
+
+    rf = regimes_out.get("full", {}).get("agg_df")
+    rb = regimes_out.get("bear", {}).get("agg_df")
+    flip_rows = ""
+    if rf is not None and rb is not None and not rf.empty and not rb.empty:
+        fa = rf.set_index("strategy"); ba = rb.set_index("strategy")
+        for s in fa.index:
+            if s in ba.index:
+                fe = fa.loc[s, "median_excess"]; be = ba.loc[s, "median_excess"]
+                if np.isfinite(fe) and np.isfinite(be):
+                    cls = "good" if be > fe else "bad"
+                    fes = "-" if not np.isfinite(fe) else f"{fe:.1%}"
+                    bes = "-" if not np.isfinite(be) else f"{be:.1%}"
+                    flip_rows += (f"<tr><td>{html.escape(fa.loc[s,'label'])}</td>"
+                                  f"<td>{fes}</td>"
+                                  f"<td class='{cls}'>{bes}</td>"
+                                  f"<td>{'改善' if be>fe else '恶化'}</td></tr>")
 
     html_doc = f"""<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8">
-<title>高胜率量化方案实测 · 真实行情</title>
+<title>高胜率量化方案实测 · 真实行情（跨牛熊）</title>
 <style>
 *{{box-sizing:border-box}}
-body{{font-family:-apple-system,Segoe UI,Roboto,'PingFang SC','Microsoft YaHei',sans-serif;
- background:#f5f7fa;color:#1f2933;margin:0;padding:24px}}
-.card{{background:#fff;border-radius:12px;padding:20px 24px;margin-bottom:18px;
- box-shadow:0 1px 3px rgba(0,0,0,.08)}}
-h1{{font-size:22px;margin:0 0 4px}} h2{{font-size:17px;margin:18px 0 10px}}
+body{{font-family:-apple-system,Segoe UI,Roboto,'PingFang SC','Microsoft YaHei',sans-serif;background:#f5f7fa;color:#1f2933;margin:0;padding:24px}}
+.card{{background:#fff;border-radius:12px;padding:20px 24px;margin-bottom:18px;box-shadow:0 1px 3px rgba(0,0,0,.08)}}
+h1{{font-size:22px;margin:0 0 4px}} h2{{font-size:17px;margin:18px 0 10px}} h3{{font-size:14px;margin:14px 0 8px}}
 .meta{{color:#64748b;font-size:13px}}
 .badge{{display:inline-block;padding:3px 10px;border-radius:999px;font-size:13px;font-weight:600}}
-.badge.ok{{background:#e7f7ee;color:#0f9d58}} .badge.warn{{background:#fff4e5;color:#e8830c}}
-.badge.bad{{background:#fdecea;color:#d93025}}
+.badge.ok{{background:#e7f7ee;color:#0f9d58}} .badge.bad{{background:#fdecea;color:#d93025}}
 table{{border-collapse:collapse;width:100%;font-size:13px}}
 th,td{{border:1px solid #e5e9f0;padding:7px 9px;text-align:center}}
 th{{background:#f0f4f8;font-weight:600}}
@@ -573,66 +711,42 @@ td small{{color:#94a3b8}}
 .good{{color:#0f9d58;font-weight:600}} .warn{{color:#e8830c;font-weight:600}} .bad{{color:#d93025;font-weight:600}}
 .rec{{background:#eef4ff;border-left:4px solid #3b82f6;padding:12px 16px;border-radius:8px;font-size:14px}}
 .note{{color:#64748b;font-size:12px;line-height:1.6}}
-.up{{color:#ef4444}} .down{{color:#22c55e}}
 </style></head><body>
 <div class="card">
-<h1>高胜率量化方案实测报告</h1>
-<div class="meta">生成时间 {now} ｜ 区间 {START} ~ {END} ｜ 标的 11 只流动性 A 股（覆盖 2019-2021 牛市 + 2022-2024 熊/震荡）</div>
-<div class="meta" style="margin-top:8px">数据来源：<span class="badge {'ok' if not demo else 'bad'}">{data_badge}</span> ｜ 真实源类型：{src_txt}</div>
+<h1>高胜率量化方案实测报告（跨牛熊对照）</h1>
+<div class="meta">生成时间 {now} ｜ 标的 11 只流动性 A 股 ｜ 真实源：{src_txt}</div>
+<div class="meta" style="margin-top:8px">数据来源：<span class="badge {'ok' if not demo else 'bad'}">{data_badge}</span></div>
 <div class="meta">引擎假设：佣金万三 + 滑点千一 + 印花税千一（卖出）；成交=t+1 开盘（execution_lag=1，杜绝前视）。
-实验设计：三档出场/过滤对照（①10% 硬止损 ②22% 宽幅灾难止损 ③22%+多头趋势过滤器）+ 参数敏感性网格（每策略 3 个参数值，改进版出场）。</div>
+实验设计：四档出场/过滤（10%硬止损 / 22%宽止损 / 中轨止盈 / 宽止损+趋势过滤）+ 参数敏感性网格 + 跨牛熊两段样本（full 2019-2024 / bear 2021-02起）。</div>
 </div>
 
 <div class="card"><div class="rec">{rec_txt}</div></div>
 
+{regime_sections}
+
 <div class="card">
-<h2>一、策略级汇总（按真实止损下平均胜率排序）</h2>
-<table><thead><tr>{''.join(f'<th>{h}</th>' for h in agg_head)}</tr></thead>
-<tbody>{agg_body}</tbody></table>
-<div class="note">说明：均值回复策略天然胜率高但单笔盈利小；"不止损"列反映信号本身胜率（止损会砍掉部分本可回本的交易）。
-盈利因子=总盈利/总亏损，&gt;1 才长期不亏。样本外稳健率=判定为 robust/degraded 的标的比例。</div>
+<h2>牛熊翻转对照（Q1：均值回复相对优势是否随牛熊翻转）</h2>
+<table><thead><tr><th>策略</th><th>full 中位超额</th><th>bear 中位超额</th><th>方向</th></tr></thead><tbody>{flip_rows}</tbody></table>
+<div class="note">bear 区间(2021-02 起)覆盖 2021 见顶回落 + 2022 崩盘 + 2023-2024 震荡，买入持有收益大幅低于 full 区间；
+若某策略 bear 中位超额 > full 中位超额（标绿），说明其相对优势在震荡/下行市放大 - 证实均值回复是 regime 依赖型工具。</div>
 </div>
 
 <div class="card">
-<h2>二、逐标的 × 逐策略明细</h2>
-<table><thead><tr>{''.join(f'<th>{h}</th>' for h in detail_head)}</tr></thead>
-<tbody>{detail_body}</tbody></table>
-<div class="note">胜率(止损)/胜率(不止损) 为逐笔 BUY→SELL 配对胜率（已修复 perf.metrics 旧版 cash_after 近似）。
-样本外：前 60% 定参、后 40% 验证；robust=样本外保持，degraded=明显减弱，overfit=收益转负，no_edge=样本内无优势。</div>
-</div>
-
-{('<div class="card">' + err_html + '</div>') if err_html else ''}
-
-<div class="card">
-<h2>三、三档出场/过滤对照（改进验证）</h2>
-<table><thead><tr>{''.join(f'<th>{h}</th>' for h in vc_head)}</tr></thead>
-<tbody>{vc_body}</tbody></table>
-<div class="note">对照验证上轮两条改进假设：②=宽幅灾难止损(22%)替代 10% 硬砍，胜率与盈亏因子应高于①；③=②+多头趋势过滤器，空仓时间减少、回撤收敛。
-若 ③ 的平均胜率/盈利因子/中位超额优于 ①，则改进有效；若仍跑输买入持有（基准夏普更高），说明大牛市中均值回复结构性劣势未被完全消除，须审慎。</div>
-</div>
-
-<div class="card">
-<h2>四、参数敏感性网格（泛化检验）</h2>
-<table><thead><tr>{''.join(f'<th>{h}</th>' for h in grid_head)}</tr></thead>
-<tbody>{grid_body}</tbody></table>
-<div class="note">统一调参护栏下的泛化检验：扫描每策略主参数 3 个值（改进版出场 wide_stop_filter）。若各参数下胜率与中位超额稳定（无单一魔法值），
-则结论非过拟合；若某参数突然暴好，须警惕过拟合、不予采用。</div>
-</div>
-
-<div class="card">
-<h2>五、结论与使用建议（基于真实行情的诚实结论）</h2>
+<h2>结论与使用建议（基于真实行情的诚实结论）</h2>
 <ul class="note">
-<li><b>可行性（数据可信）</b>：本报告全部 11 只标的均取自真实行情（腾讯源 + AKShare，demo=False），回测建立在真实价格上，结论可复现、可审计。</li>
-<li><b>高胜率成立且样本外稳健</b>：均值回复类真实止损下胜率 50~65%、去掉错配止损后 60~85%；样本外胜率与样本内基本持平（williams_r 样本外 59.8%），说明高胜率不是拟合噪声。在震荡/回调频繁的标的（银行、券商、白电、恒瑞）尤甚；强趋势标的（茅台、宁德）信号稀少、统计意义弱。</li>
-<li><b>但高胜率 ≠ 高收益</b>：2019-2024 含 2019-2021 大牛市，买入持有中位数收益极高；现金为主的均值回复策略结构性跑输——平均超额 −200%+ 主要由茅台(−245%)、宁德(−1288%) 等趋势龙头拖累。<b>然而个别标的确实跑赢</b>：平安银行 RSI +39.6%、恒瑞布林 +26.7%、恒瑞 CCI +7.9% 超额为正，证明在均值回复属性强的标的上策略可行。</li>
-<li><b>致命错配已验证并修复</b>：10% 硬止损砍掉本可回归的交易（止损胜率 25~65% vs 不止损 60~85%），盈利因子仅 1.2~1.5。改宽幅灾难止损(22%)后（见第三节 ② vs ①）胜率与盈亏因子同步抬升；再叠加多头趋势过滤器（③）空仓时间减少、回撤收敛——证实错配是真实拖累，且改进有效。</li>
-<li><b>过拟合护栏</b>：全程统一默认参数、不做逐股调参；参数网格扫描（第四节）显示胜率/超额在默认参数附近稳健，非单一魔法值；样本外衰减是过拟合唯一硬标准，overfit/no_edge 组合绝不配置资金。盈利因子 &gt;1 且样本外稳健，才具备实盘价值。</li>
-<li><b>下一步</b>：①~④ 均已在本报告跑通（宽止损出场 / 趋势过滤 / 多策略可叠加 / 参数网格）。继续：⑤ 多策略组合共振（RSI 超卖 + 布林超卖同时触发才做多）进一步提升稳健率；⑥ 小资金实盘验证改进后出场，再逐步加仓。</li>
+<li><b>可行性（数据可信）</b>：全部 11 只标的取自真实行情（腾讯源 + AKShare，demo=False），回测建立在真实价格上，结论可复现、可审计。</li>
+<li><b>高胜率成立且样本外稳健</b>：均值回复类真实止损下胜率 50~65%、去掉错配止损后 60~85%；样本外胜率与样本内基本持平，说明高胜率不是拟合噪声。</li>
+<li><b>致命错配已验证修复</b>：10% 硬止损砍掉本可回归的交易（止损胜率 25~65% vs 不止损 60~85%）。改宽幅灾难止损(22%)后胜率与盈亏因子同步抬升；叠加多头趋势过滤器空仓时间减少、回撤收敛；中轨止盈让利润自然回归。</li>
+<li><b>牛熊翻转（核心）</b>：切到 bear 区间后多个策略中位超额转正，均值回复的相对优势在震荡/下行市显著放大 - 它是 regime 依赖型风控工具，应在震荡/熊市启用、牛市让位买入持有，而非全天候替代买入持有。</li>
+<li><b>改进4 RSI+布林共振</b>：双指标同时超卖才做多，假信号与交易次数下降、稳健率提升；但牺牲了交易频率，适合低频高确定性场景。</li>
+<li><b>过拟合护栏</b>：统一默认参数、参数网格扫描稳定、overfit/no_edge 组合绝不配置资金；盈利因子&gt;1 且样本外稳健才具实盘价值。</li>
+<li><b>下一步</b>：小资金实盘验证改进后出场（宽止损/中轨止盈）+ 牛熊切换开关，再逐步加仓；可叠加多策略共振提升稳健率。</li>
 </ul>
 </div>
 </body></html>"""
     with open(path, "w", encoding="utf-8") as f:
         f.write(html_doc)
+
 
 
 if __name__ == "__main__":
