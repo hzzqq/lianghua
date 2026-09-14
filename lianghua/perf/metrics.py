@@ -100,13 +100,66 @@ def summary(equity: pd.Series, trades: list[dict]) -> dict:
 
 
 def win_rate(trades: list[dict]) -> float:
-    """成交胜率（按配对买卖粗略估算）。"""
+    """成交胜率（按配对买卖粗略估算）。
+
+    .. deprecated::
+        该方法用相邻 ``cash_after`` 的单调变化近似胜率，对含止损平仓、资金约束
+        导致的非单调现金曲线极不稳健（会系统性高估或低估）。请改用
+        :func:`round_trip_win_rate`（严格按 BUY→SELL 配对计算真实回合胜率）。
+        此处保留仅为向后兼容。
+    """
     if not trades:
         return 0.0
     pnl = [float(t.get("cash_after", 0.0)) for t in trades]
     # 以 cash_after 单调变化近似：上涨笔数占比
     ups = sum(1 for i in range(1, len(pnl)) if pnl[i] > pnl[i - 1])
     return ups / max(1, len(pnl) - 1)
+
+
+def round_trip_stats(trades: list[dict]) -> dict:
+    """按 BUY→SELL 严格配对的逐笔回合统计（修复 win_rate 的近似缺陷）。
+
+    回测引擎每轮持仓恰好一笔 BUY + 一笔 SELL（含止损平仓 reason="stop_loss"），
+    故可顺序配对。每回合净收益 = 卖出所得(价×量 − 费−税) − 买入成本(价×量 + 费)。
+    胜 = 净收益 > 0。返回胜率、平均盈利、平均亏损、盈利因子、总净收益与回合数。
+
+    这是「高胜率」类策略唯一可信的胜率口径：win_rate 的 cash_after 近似在
+    现金曲线非单调（止损、分批、资金约束）时会失真。
+    """
+    trips: list[float] = []
+    entry: tuple[float, float, float] | None = None
+    for t in trades:
+        side = t.get("side")
+        if side == "BUY":
+            entry = (float(t["price"]), float(t["qty"]), float(t.get("fee", 0.0)))
+        elif side == "SELL" and entry is not None:
+            bp, bq, bf = entry
+            sp = float(t["price"]); sq = float(t["qty"]); sf = float(t.get("fee", 0.0))
+            buy_cost = bp * bq + bf
+            sell_pro = sp * sq - sf
+            trips.append(sell_pro - buy_cost)
+            entry = None
+    if not trips:
+        return {"n": 0, "win_rate": 0.0, "avg_win": 0.0, "avg_loss": 0.0,
+                "profit_factor": 0.0, "total_pnl": 0.0}
+    wins = [p for p in trips if p > 0]
+    losses = [p for p in trips if p <= 0]
+    gross_win = sum(wins)
+    gross_loss = -sum(losses)
+    pf = (gross_win / gross_loss) if gross_loss > 0 else (float("inf") if gross_win > 0 else 0.0)
+    return {
+        "n": len(trips),
+        "win_rate": (len(wins) / len(trips)) if trips else 0.0,
+        "avg_win": (gross_win / len(wins)) if wins else 0.0,
+        "avg_loss": (gross_loss / len(losses)) if losses else 0.0,
+        "profit_factor": pf,
+        "total_pnl": (gross_win - gross_loss),
+    }
+
+
+def round_trip_win_rate(trades: list[dict]) -> float:
+    """逐笔配对胜率（真实口径）。详见 :func:`round_trip_stats`。"""
+    return round_trip_stats(trades)["win_rate"]
 
 
 def buyhold_equity(df: pd.DataFrame, init_cash: float = 1_000_000.0) -> pd.Series:
@@ -130,7 +183,7 @@ def report(equity: pd.Series, trades: list[dict], df: pd.DataFrame | None = None
     """扩展绩效报告：含基准对比与胜率。"""
     s = _guard_equity(equity)
     rep = summary(s, trades)
-    rep["win_rate"] = win_rate(trades)
+    rep["win_rate"] = round_trip_win_rate(trades)
     if df is not None and len(df) == len(s):
         bench = buyhold_equity(df, init_cash)
         rep["benchmark_return"] = float(bench.iloc[-1] / bench.iloc[0] - 1)
