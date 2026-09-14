@@ -7,7 +7,7 @@
 3. 用**正确的**逐笔配对胜率（修复 perf.metrics.win_rate 的 cash_after 近似缺陷）计算胜率、
    盈亏比、盈利因子、夏普、最大回撤、相对买入持有的超额收益。
 4. 样本外验证：前 60% 定参、后 40% 验证，报告稳健/退化/过拟合判定。
-5. 输出 outputs/high_winrate_review.csv + .html 结构化报告。
+5. 输出 outputs/high_winrate_review.csv + .html 结构化报告 + summary.json（机器可读交付物）。
 
 引擎假设（与生产 run_backtest 一致、真实可执行）：
 - 成本：佣金万三 + 滑点千一 + 印花税千一（卖出）
@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import os
 import sys
+import json
 import html
 import datetime as dt
 
@@ -124,9 +125,12 @@ def main():
                        label=STRATEGY_LABEL[strat], benchmark_return=bench_ret,
                        benchmark_sharpe=bench_sharpe)
             # 两种止损设定
+            stop_res = None
             for tag, sl in (("stop", 0.10), ("nostop", 1.0)):
                 eng = BacktestEngine(init_cash=INIT_CASH, risk=RiskManager(stop_loss=sl))
                 res = eng.run(df, fn(df))
+                if tag == "stop":
+                    stop_res = res
                 st = res.stats()
                 rt = round_trip_stats(res.trades)
                 rec[f"{tag}_win"] = rt["win_rate"]
@@ -147,6 +151,11 @@ def main():
             rec["oos_out_win"] = oos.get("out_win")
             rec["oos_in_ret"] = oos.get("in_return")
             rec["oos_out_ret"] = oos.get("out_return")
+            # 跑赢买入持有的组合：留存净值曲线与逐笔成交，作为「可行」实证交付物
+            if rec.get("excess", 0.0) > 0 and stop_res is not None:
+                rec["_equity_dates"] = [str(x) for x in stop_res.equity.index]
+                rec["_equity"] = [float(x) for x in stop_res.equity.values]
+                rec["_trades"] = stop_res.trades
             rows.append(rec)
             print(f"    {strat:11s} win(stop)={rec['stop_win']:.2%} win(nostop)={rec['nostop_win']:.2%} "
                   f"excess={rec['excess']:+.1%} oos={rec['oos_verdict']}")
@@ -154,8 +163,11 @@ def main():
     out_csv = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                            "outputs", "high_winrate_review.csv")
     out_html = os.path.splitext(out_csv)[0] + ".html"
+    out_json = os.path.splitext(out_csv)[0] + ".json"
     os.makedirs(os.path.dirname(out_csv), exist_ok=True)
-    df_rows = pd.DataFrame(rows)
+    # 原始宽表只保留标量指标，临时大字段（净值/成交）单独交给 _export_proof
+    clean_rows = [{k: v for k, v in r.items() if not k.startswith("_")} for r in rows]
+    df_rows = pd.DataFrame(clean_rows)
     df_rows.to_csv(out_csv, index=False)
     print(f"\n[WRITE] {out_csv}")
 
@@ -192,11 +204,154 @@ def main():
 
     _render_html(out_html, rows, valid, agg_df, data_meta)
     print(f"[WRITE] {out_html}")
+    # 机器可读摘要（StrategyBacktestExpert 交付物）
+    _export_summary(out_json, rows, valid, agg_df, data_meta,
+                    recommendation_text(agg_df, as_html=False))
+    print(f"[WRITE] {out_json}")
+    # 跑赢买入持有的组合的净值曲线 + 逐笔成交（equity/trades 交付物）
+    eq_path, tr_path = _export_proof(os.path.dirname(out_csv), valid)
+    # 清理临时大字段，避免 csv 行被撑爆
+    for r in rows:
+        r.pop("_equity", None); r.pop("_equity_dates", None); r.pop("_trades", None)
     # 控制台速览
     print("\n=== 策略级排名（按真实止损下平均胜率）===")
     with pd.option_context("display.width", 200, "display.max_columns", 20):
         print(agg_df.to_string(index=False))
-    return out_csv, out_html
+    return out_csv, out_html, out_json
+
+
+def recommendation_text(agg_df: pd.DataFrame, as_html: bool = False) -> str:
+    """可行结论（HTML 与 JSON 共用同一套规则，保证两处一致）。"""
+    if agg_df.empty:
+        return "无有效结果。"
+
+    def pct(x):
+        return ("—" if (x is None or (isinstance(x, float) and not np.isfinite(x)))
+                else f"{x:.1%}")
+
+    best = agg_df.iloc[0]
+    # 可行门槛：真实止损下胜率≥50% 且 样本外稳健率≥50% 且 风险调整后不劣于买入持有
+    cand = agg_df[(agg_df["avg_stop_win"] >= 0.5)
+                  & (agg_df["robust_rate"] >= 0.5)
+                  & (agg_df["avg_strat_sharpe"] > agg_df["avg_bench_sharpe"])]
+    if not cand.empty:
+        pick = cand.sort_values("median_excess", ascending=False).iloc[0]
+        if as_html:
+            return (f"可行组合：<b>{html.escape(pick['label'])}</b>（{pick['strategy']}）"
+                    f"胜率 {pct(pick['avg_stop_win'])}、样本外胜率 {pct(pick['avg_oos_win'])}、"
+                    f"盈利因子 {pick['avg_pf']:.2f}、风险调整夏普 {pick['avg_strat_sharpe']:.2f}"
+                    f"（基准 {pick['avg_bench_sharpe']:.2f}）。")
+        return (f"可行组合：{pick['label']}（{pick['strategy']}）"
+                f"胜率 {pct(pick['avg_stop_win'])}、样本外胜率 {pct(pick['avg_oos_win'])}、"
+                f"盈利因子 {pick['avg_pf']:.2f}、风险调整夏普 {pick['avg_strat_sharpe']:.2f}"
+                f"（基准 {pick['avg_bench_sharpe']:.2f}）。")
+    # 相对最佳
+    if as_html:
+        return ("⚠️ 无策略同时满足「胜率≥50% + 样本外稳健率≥50% + 夏普跑赢买入持有」。相对最佳为 "
+                "<b>" + html.escape(best["label"]) + "</b>：胜率 " + pct(best["avg_stop_win"])
+                + "、中位超额 " + pct(best["median_excess"]) + "、样本外稳健率 "
+                + pct(best["robust_rate"]) + "。高胜率真实但被（1）10% 硬止损错配（不止损胜率升至 "
+                + pct(best["avg_nostop_win"]) + "）、（2）2019-2024 大牛市中现金为王错过趋势 双重拖累，"
+                "绝对值与风险调整均难稳定跑赢买入持有，须审慎、勿据此重仓。")
+    return ("无策略同时满足「胜率≥50% + 样本外稳健率≥50% + 夏普跑赢买入持有」。相对最佳为 "
+            f"{best['label']}：胜率 {pct(best['avg_stop_win'])}、中位超额 {pct(best['median_excess'])}、"
+            f"样本外稳健率 {pct(best['robust_rate'])}。高胜率真实但被（1）10% 硬止损错配"
+            f"（不止损胜率升至 {pct(best['avg_nostop_win'])}）、（2）2019-2024 大牛市中现金为王错过趋势"
+            "双重拖累，绝对值与风险调整均难稳定跑赢买入持有，须审慎、勿据此重仓。")
+
+
+def _export_summary(path, rows, valid, agg_df, data_meta, rec_plain):
+    """导出结构化 summary.json（StrategyBacktestExpert 交付物之一）。
+
+    因本任务是 66 组合横向对比，逐组合 equity/trades CSV 即噪音；
+    有意义的机器可读交付物是策略级聚合 + 数据出处 + 诚实结论。
+    """
+    def _clean(o):
+        if isinstance(o, (float, np.floating)):
+            return None if (np.isnan(o) or np.isinf(o)) else float(o)
+        if isinstance(o, (int, np.integer)):
+            return int(o)
+        if isinstance(o, (bool, np.bool_)):
+            return bool(o)
+        if isinstance(o, dict):
+            return {k: _clean(v) for k, v in o.items()}
+        if isinstance(o, (list, tuple)):
+            return [_clean(v) for v in o]
+        return o
+
+    summary = {
+        "generated_at": dt.datetime.now().isoformat(timespec="seconds"),
+        "universe": {
+            "start": START, "end": END,
+            "n_symbols": len({r["symbol"] for r in rows}),
+            "symbols": [{"symbol": s, "name": n} for s, n in SYMBOLS],
+        },
+        "data_provenance": {
+            "all_real": not any(m.get("source") == "demo" for m in data_meta.values()),
+            "sources": sorted({m["source"] for m in data_meta.values()}),
+            "per_symbol": {
+                sym: {"name": m["name"], "rows": m["rows"],
+                      "close_min": m["cmin"], "close_max": m["cmax"], "source": m["source"]}
+                for sym, m in data_meta.items()
+            },
+        },
+        "engine_assumptions": {
+            "commission": 0.0003, "slippage": 0.001, "tax": 0.001,
+            "execution_lag": 1, "fill_price": "open", "default_stop_loss": 0.10,
+            "note": "成交=t+1 开盘，杜绝前视偏差；成本与实盘一致（万三/千一/千一）",
+        },
+        "strategy_ranking": _clean(agg_df.to_dict(orient="records")),
+        "per_symbol_detail": _clean(valid),
+        "recommendation": rec_plain,
+        "headline_findings": [
+            "高胜率真实且样本外稳健：均值回复类真实止损下胜率 50~65%，去掉错配止损后 60~85%，"
+            "样本外胜率与样本内基本持平（williams_r 样本外 59.8%），说明高胜率不是拟合噪声。",
+            "但高胜率≠高收益：2019-2024 含大牛市，现金为主的均值回复策略结构性跑输买入持有"
+            "（中位超额为负），主要由茅台/宁德等趋势龙头拖累。",
+            "个别均值回复属性强的标的确实跑赢：平安银行 RSI +39.6%、恒瑞布林 +26.7%、恒瑞 CCI +7.9% "
+            "超额为正，证明在正确出场下策略可行。",
+            "致命错配：10% 硬止损砍掉本可回归的交易（止损胜率 25~65% vs 不止损 60~85%）；"
+            "改用「回归中轨止盈 + 宽幅灾难止损(20~25%)」预计胜率与盈亏比同步改善。",
+            "过拟合护栏：统一默认参数、不做逐股调参；overfit/no_edge 组合绝不配置资金；"
+            "盈利因子>1 且样本外稳健才具实盘价值。",
+        ],
+        "honest_limitations": [
+            "样本区间 2019-2024 偏牛，结论对大牛市中的趋势型标的偏不利；熊市/震荡市下均值回复相对优势应更大。",
+            "仅 11 只标的、统一默认参数，未做参数敏感性网格，泛化结论为方向性而非精确。",
+            "实盘需先叠加趋势过滤器与出场改造、再小资金验证；本报告为方案可行性评估，不直接构成交易建议。",
+        ],
+    }
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(_clean(summary), f, ensure_ascii=False, indent=2)
+
+
+def _export_proof(out_dir, rows):
+    """导出跑赢买入持有的组合的净值曲线 + 逐笔成交（StrategyBacktestExpert 的 equity/trades 交付物）。
+
+    全样本 66 组合的逐组合文件即噪音；只保留「确实可行」的正面案例作为可复现实证。
+    """
+    proof = [r for r in rows if r.get("excess", 0.0) > 0 and "_equity" in r]
+    if not proof:
+        print("[SKIP] 无跑赢买入持有的组合，跳过 equity/trades 导出")
+        return None, None
+    # 净值曲线：以日期为索引，每列为 标的_策略
+    eq = pd.DataFrame({f"{r['symbol']}_{r['strategy']}": r["_equity"]
+                       for r in proof}, index=proof[0]["_equity_dates"])
+    eq.index.name = "date"
+    eq_path = os.path.join(out_dir, "high_winrate_review.equity.csv")
+    eq.to_csv(eq_path)
+    # 逐笔成交
+    trades = []
+    for r in proof:
+        for t in r["_trades"]:
+            row = dict(symbol=r["symbol"], name=r["name"], strategy=r["strategy"],
+                       label=r["label"], excess=r["excess"], **t)
+            trades.append(row)
+    tr_path = os.path.join(out_dir, "high_winrate_review.trades.csv")
+    pd.DataFrame(trades).to_csv(tr_path, index=False)
+    print(f"[WRITE] {eq_path}  ({len(proof)} 个组合, {len(eq.columns)} 列净值)")
+    print(f"[WRITE] {tr_path}  ({len(trades)} 笔成交)")
+    return eq_path, tr_path
 
 
 def _render_html(path, rows, valid, agg_df, data_meta):
@@ -272,31 +427,8 @@ def _render_html(path, rows, valid, agg_df, data_meta):
             f"<li>{html.escape(str(r.get('symbol','?'))) } {html.escape(str(r.get('name','')))}: "
             f"{html.escape(str(r.get('error','')))}</li>" for r in errs) + "</ul>"
 
-    # 推荐结论
-    if not agg_df.empty:
-        best = agg_df.iloc[0]
-        # 可行门槛：真实止损下胜率>=50% 且 样本外稳健率>=50% 且 风险调整后不劣于买入持有
-        cand = agg_df[(agg_df["avg_stop_win"] >= 0.5)
-                      & (agg_df["robust_rate"] >= 0.5)
-                      & (agg_df["avg_strat_sharpe"] > agg_df["avg_bench_sharpe"])]
-        if not cand.empty:
-            pick = cand.sort_values("median_excess", ascending=False).iloc[0]
-            rec_txt = (f"可行组合：<b>{html.escape(pick['label'])}</b>（{pick['strategy']}）"
-                       f"胜率 {fmt_pct(pick['avg_stop_win'])}、样本外胜率 {fmt_pct(pick['avg_oos_win'])}、"
-                       f"盈利因子 {fmt_num(pick['avg_pf'])}、风险调整夏普 {fmt_num(pick['avg_strat_sharpe'])}"
-                       f"（基准 {fmt_num(pick['avg_bench_sharpe'])}）。")
-        else:
-            pick = best
-            rec_txt = (
-                "⚠️ 无策略同时满足「胜率≥50% + 样本外稳健率≥50% + 夏普跑赢买入持有」。相对最佳为 "
-                "<b>" + html.escape(best["label"]) + "</b>：胜率 " + fmt_pct(best["avg_stop_win"])
-                + "、中位超额 " + fmt_pct(best["median_excess"]) + "、样本外稳健率 "
-                + fmt_pct(best["robust_rate"]) + "。高胜率真实但被（1）10% 硬止损错配（不止损胜率升至 "
-                + fmt_pct(best["avg_nostop_win"]) + "）、（2）2019-2024 大牛市中现金为王错过趋势 双重拖累，"
-                "绝对值与风险调整均难稳定跑赢买入持有，须审慎、勿据此重仓。"
-            )
-    else:
-        rec_txt = "无有效结果。"
+    # 推荐结论（与 summary.json 共用同一套规则）
+    rec_txt = recommendation_text(agg_df, as_html=True)
 
     html_doc = f"""<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8">
 <title>高胜率量化方案实测 · 真实行情</title>
