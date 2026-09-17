@@ -147,9 +147,14 @@ def _raw_http_get(url, timeout=5, stream_seconds=0, headers_only=False):
     sock.settimeout(max(timeout, stream_seconds + 2) if stream_seconds > 0 else timeout)
     try:
         sock.connect((host, port))
+        # 后端启用轻量鉴权（--token / LIANGHUA_BACKEND_TOKEN）时，终端侧自动携带同名的
+        # 环境变量令牌（R18）。SSE 也走本客户端，头方式对事件流同样生效。
         req = (f"GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\n"
-                f"Accept: */*\r\n"
-                f"Connection: {'keep-alive' if stream_seconds > 0 else 'close'}\r\n\r\n")
+                f"Accept: */*\r\n")
+        _token = (os.environ.get("LIANGHUA_BACKEND_TOKEN") or "").strip()
+        if _token:
+            req += f"X-Api-Token: {_token}\r\n"
+        req += (f"Connection: {'keep-alive' if stream_seconds > 0 else 'close'}\r\n\r\n")
         sock.sendall(req.encode("utf-8"))
         buf = b""
         while b"\r\n\r\n" not in buf:

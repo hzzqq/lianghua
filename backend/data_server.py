@@ -18,12 +18,18 @@
   可选 ``--live-poll N`` 每 N 秒刷新一次 watchlist 的实时报价并缓存到内存，供 /api/quote 秒回。
 - 断网 / 接口变更时 ``DataGateway`` 自动降级演示数据，并在响应里如实标注 ``source=demo``，
   绝不把假数据冒充真实行情返回。
+- 安全加固（R18）：默认只监听 127.0.0.1（确需局域网访问再显式 ``--host 0.0.0.0``）；
+  可选 ``--token``（或环境变量 ``LIANGHUA_BACKEND_TOKEN``）启用轻量鉴权——除 /api/health
+  心跳外所有端点要求请求头 ``X-Api-Token`` 或查询参数 ``?token=``（SSE 走查询参数）；
+  可选 ``--read-only`` 禁用 /api/refresh（唯一会写缓存的端点），其余端点天然只读。
 """
 from __future__ import annotations
 
 import argparse
+import hmac
 import json
 import logging
+import os
 import sys
 import threading
 import time
@@ -243,6 +249,15 @@ class Handler(BaseHTTPRequestHandler):
         route = parsed.path
         q = dict(urllib.parse.parse_qsl(parsed.query))
         backend: Backend = self.server.backend  # type: ignore[attr-defined]
+        # —— 轻量鉴权（R18）：配置令牌后，除健康心跳外全部要求令牌。
+        # 心跳保持无鉴权：终端以 2~5s 超时高频轮询它判断后端存活，且不泄露行情数据。
+        token = str(getattr(self.server, "auth_token", "") or "")
+        if token and route != "/api/health":
+            supplied = str(self.headers.get("X-Api-Token") or q.get("token") or "")
+            if not hmac.compare_digest(supplied, token):
+                self._err(403, "缺少或错误的访问令牌：服务端以 --token/LIANGHUA_BACKEND_TOKEN "
+                               "启用鉴权，请在请求头 X-Api-Token 或查询参数 ?token= 中携带")
+                return
         try:
             if route in ("/", "/api"):
                 self._send(200, {
@@ -309,6 +324,10 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, backend.gw.list_cached())
                 return
             if route == "/api/refresh":
+                # 只读模式（--read-only）下禁用：这是唯一会写缓存的端点（R18 安全加固）
+                if getattr(self.server, "read_only", False):
+                    self._err(403, "后端以只读模式(--read-only)运行，强制刷新已禁用")
+                    return
                 # 强制回源刷新某标的真实历史行情进本地缓存（绕过缓存命中）
                 sym = q.get("symbol")
                 if not sym:
@@ -363,8 +382,14 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     ap = argparse.ArgumentParser(description="Lianghua 真实行情后端服务")
-    ap.add_argument("--host", default="0.0.0.0", help="监听地址 (默认 0.0.0.0)")
+    ap.add_argument("--host", default="127.0.0.1",
+                    help="监听地址 (默认 127.0.0.1 仅本机；确需局域网访问再显式 --host 0.0.0.0)")
     ap.add_argument("--port", type=int, default=DEFAULT_PORT, help=f"监听端口 (默认 {DEFAULT_PORT})")
+    ap.add_argument("--token", default=os.environ.get("LIANGHUA_BACKEND_TOKEN", ""),
+                    help="访问令牌：设置后除 /api/health 外全部要求请求头 X-Api-Token 或 ?token= "
+                         "(默认读环境变量 LIANGHUA_BACKEND_TOKEN，空=不鉴权)")
+    ap.add_argument("--read-only", action="store_true",
+                    help="只读模式：禁用 /api/refresh（唯一会写缓存的端点）")
     ap.add_argument("--no-warm", action="store_true", help="启动不预热 watchlist")
     ap.add_argument("--live-poll", type=float, default=0,
                    help="实时报价轮询间隔秒数 (0=关闭，建议 30)")
@@ -376,6 +401,8 @@ def main():
     backend = Backend(watchlist_path=args.watchlist, real_timeout=args.timeout)
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     server.backend = backend  # type: ignore[attr-defined]
+    server.auth_token = (args.token or "").strip()  # type: ignore[attr-defined]
+    server.read_only = bool(args.read_only)  # type: ignore[attr-defined]
 
     if not args.no_warm:
         logger.info("启动预热真实行情缓存 ...")
@@ -387,8 +414,9 @@ def main():
             target=backend.live_poll_loop, args=(args.live_poll,), daemon=True)
         poll_thread.start()
 
-    logger.info("真实行情后端已启动: http://%s:%d  (--live-poll=%s)",
-                args.host, args.port, args.live_poll)
+    logger.info("真实行情后端已启动: http://%s:%d  (--live-poll=%s, 鉴权=%s, 只读=%s)",
+                args.host, args.port, args.live_poll,
+                "开" if server.auth_token else "关", server.read_only)
     logger.info("快速自检: curl http://localhost:%d/api/health", args.port)
     try:
         server.serve_forever()

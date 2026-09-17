@@ -60,6 +60,7 @@ def test_no_retry_falls_to_demo_with_observability(gw):
         raise ConnectionError("persistent failure")
 
     gw._from_akshare = always_fail
+    gw._from_tencent = always_fail   # R17 腾讯兜底：联网沙箱会真返回真实数据，必须一并钉死
     gw._from_baostock = always_fail
     df = gw.fetch("600000.SH", "2024-01-01", "2024-01-10",
                   asset="stock", retries=0, backoff=0)
@@ -78,6 +79,7 @@ def test_demo_fallback_emits_warning_log(gw, caplog):
         raise ConnectionError("persistent failure")
 
     gw._from_akshare = always_fail
+    gw._from_tencent = always_fail   # 同上：腾讯兜底必须钉死，否则联网环境走不到降级分支
     gw._from_baostock = always_fail
     with caplog.at_level(logging.WARNING):
         gw.fetch("600000.SH", "2024-01-01", "2024-01-10", asset="stock")

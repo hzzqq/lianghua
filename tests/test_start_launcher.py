@@ -26,13 +26,16 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # run.bat / run.sh 是 Windows / Unix 主入口，启动量化终端.bat 是中文名双击入口。
 # 启动类入口（转调 start.py，会被 test_bat_actually_runs 实跑）。
 BAT_FILES = ["run.bat", "启动量化终端.bat"]
+# 一键编排入口（自己拉起后端 8600 + 终端 8510，不转调 start.py、没有 --help 语义；
+# 实跑会真的启动服务，因此只参加静态体检，不参加 cmd --help 冒烟）。
+BAT_FILES_STATIC = ["start_all.bat"]
 # 停止类脚本：不转调 start.py，因此不参加 test_bat_actually_runs 的 --help 冒烟。
 STOP_BAT_FILES = ["停止量化终端.bat"]
-SH_FILES = ["run.sh"]
+SH_FILES = ["run.sh", "start_all.sh", "stop_all.sh"]
 BOM = b"\xef\xbb\xbf"
 
 
-@pytest.mark.parametrize("name", BAT_FILES + STOP_BAT_FILES + SH_FILES + ["start.py"])
+@pytest.mark.parametrize("name", BAT_FILES + BAT_FILES_STATIC + STOP_BAT_FILES + SH_FILES + ["start.py"])
 def test_declared_launchers_exist(name):
     """清单里的启动入口必须真实存在。
 
@@ -57,7 +60,7 @@ def start_mod():
     return _load_start_module()
 
 
-@pytest.mark.parametrize("name", BAT_FILES + STOP_BAT_FILES)
+@pytest.mark.parametrize("name", BAT_FILES + BAT_FILES_STATIC + STOP_BAT_FILES)
 def test_bat_has_no_utf8_bom(name):
     """.bat 文件不能有 BOM，否则 cmd.exe 第一行报错且 @echo off 不生效。"""
     path = os.path.join(ROOT, name)
@@ -68,7 +71,7 @@ def test_bat_has_no_utf8_bom(name):
     assert head != BOM, f"{name} 带 UTF-8 BOM，会导致 cmd.exe 启动报错"
 
 
-@pytest.mark.parametrize("name", BAT_FILES + STOP_BAT_FILES + SH_FILES + ["start.py"])
+@pytest.mark.parametrize("name", BAT_FILES + BAT_FILES_STATIC + STOP_BAT_FILES + ["start.py"])
 def test_no_machine_specific_python_path(name):
     """启动脚本不得写死某个用户的 python 绝对路径（换机器就废）。"""
     path = os.path.join(ROOT, name)
@@ -79,7 +82,7 @@ def test_no_machine_specific_python_path(name):
         assert bad not in text, f"{name} 写死了机器相关路径 {bad}"
 
 
-@pytest.mark.parametrize("name", BAT_FILES + STOP_BAT_FILES)
+@pytest.mark.parametrize("name", BAT_FILES + BAT_FILES_STATIC + STOP_BAT_FILES)
 def test_bat_body_is_pure_ascii(name):
     """.bat 正文必须是纯 ASCII（文件名可以是中文，那是文件系统层面的事）。
 
@@ -282,7 +285,7 @@ def test_launcher_lists_cover_every_shipped_script():
     tracked = _tracked_root_launchers()
     if tracked is None:
         pytest.skip("git 不可用")
-    declared = sorted(BAT_FILES + STOP_BAT_FILES + SH_FILES)
+    declared = sorted(BAT_FILES + BAT_FILES_STATIC + STOP_BAT_FILES + SH_FILES)
     assert declared == tracked, (
         f"启动入口名单与仓库实际内容不一致：名单={declared}，仓库={tracked}。\n"
         "新增入口脚本时必须同步登记到 BAT_FILES / SH_FILES，否则该入口不受任何"
@@ -305,10 +308,12 @@ def test_no_dangling_launcher_references():
     """
     import re
 
-    sources = ["README.md", "start.py", *BAT_FILES, *STOP_BAT_FILES, *SH_FILES]
-    # 先抹掉脚本里的路径前缀（cmd 的 %~dp0、shell 的 ./ 等），只留文件名
+    sources = ["README.md", "start.py", *BAT_FILES, *BAT_FILES_STATIC,
+               *STOP_BAT_FILES, *SH_FILES]
+    # 先抹掉脚本里的路径前缀（cmd 的 %~dp0、shell 的 ./ 等），只留文件名；
+    # 引用模式保留目录前缀（backend/xxx.bat 这类合法子目录引用要按真实路径解析）。
     prefix = re.compile(r"%~dp0|\$\{?BASEDIR\}?/|\./")
-    pattern = re.compile(r"([\w\u4e00-\u9fff\-]+\.(?:bat|sh))\b")
+    pattern = re.compile(r"([\w\u4e00-\u9fff\-\\/]+\.(?:bat|sh))\b")
     runnable = re.compile(
         r"(?:python3?|streamlit run)\s+"
         r"((?:[\w\u4e00-\u9fff.\-]+/)*[\w\u4e00-\u9fff.\-]+\.py)"
@@ -321,7 +326,9 @@ def test_no_dangling_launcher_references():
         text = prefix.sub(" ", open(src_path, encoding="utf-8").read())
         refs = set(pattern.findall(text)) | set(runnable.findall(text))
         for ref in refs:
-            if not os.path.exists(os.path.join(ROOT, ref)):
+            # 统一成正斜杠后按仓库根解析（引用里可能出现 backend\xxx.bat 反斜杠形式）
+            parts = ref.replace("\\", "/").split("/")
+            if not os.path.exists(os.path.join(ROOT, *parts)):
                 dangling.append(f"{src} -> {ref}")
     assert not dangling, "引用了不存在的启动脚本：" + "; ".join(sorted(dangling))
 
@@ -405,3 +412,66 @@ def test_default_host_is_loopback(start_mod, monkeypatch):
         start_mod.main()
     assert parsed["host"] == "127.0.0.1"
     assert parsed["port"] == 8501
+
+
+def test_supervisor_flag_default_off_and_parses(start_mod, monkeypatch):
+    """--supervisor 开关：默认关闭，传入后为 True（守护自愈模式入口）。"""
+    import argparse
+
+    real_parse = argparse.ArgumentParser.parse_args
+
+    def make_spy(bucket: dict):
+        def spy(self, *a, **kw):
+            ns = real_parse(self, *a, **kw)
+            bucket.update(vars(ns))
+            raise SystemExit(0)
+        return spy
+
+    monkeypatch.setattr(sys, "argv", ["start.py"])
+    monkeypatch.setattr(argparse.ArgumentParser, "parse_args", make_spy({}))
+    with pytest.raises(SystemExit):
+        start_mod.main()
+
+    parsed = {}
+    monkeypatch.setattr(sys, "argv", ["start.py", "--supervisor"])
+    monkeypatch.setattr(argparse.ArgumentParser, "parse_args", make_spy(parsed))
+    with pytest.raises(SystemExit):
+        start_mod.main()
+    assert parsed["supervisor"] is True
+
+
+def test_supervisor_cmd_targets_existing_script(start_mod, monkeypatch, tmp_path):
+    """守护模式必须转调真实存在的 tools/terminal_supervisor.py，端口/地址经 env 透传。"""
+    monkeypatch.setattr(start_mod, "ROOT", str(tmp_path))
+    args = argparse_namespace(start_mod, port=8510, host="127.0.0.1")
+    cmd, env = start_mod._supervisor_cmd_env("python-x", args)
+    assert cmd[0] == "python-x"
+    assert cmd[1] == os.path.join(str(tmp_path), "tools", "terminal_supervisor.py")
+    assert env["LH_TERMINAL_PORT"] == "8510"
+    assert env["LH_TERMINAL_HOST"] == "127.0.0.1"
+    # 真实仓库里脚本必须存在（ROOT 被 patch 只影响构造，存在性用真仓库验证）
+    monkeypatch.setattr(start_mod, "ROOT", ROOT)
+    cmd, _ = start_mod._supervisor_cmd_env("python-x", args)
+    assert os.path.isfile(cmd[1]), "tools/terminal_supervisor.py 缺失，--supervisor 会启动失败"
+
+
+def test_supervisor_running_requires_valid_pid(start_mod, monkeypatch, tmp_path):
+    """_supervisor_running：无 pid 文件 / 垃圾内容 / 死进程 → False。"""
+    monkeypatch.setattr(start_mod, "ROOT", str(tmp_path))
+    # 无文件
+    assert start_mod._supervisor_running() is False
+    # 垃圾内容
+    (tmp_path / "supervisor.pid").write_text("not-a-pid", encoding="utf-8")
+    assert start_mod._supervisor_running() is False
+    # 死进程（psutil 可选：缺失时返回 False 亦符合契约）
+    (tmp_path / "supervisor.pid").write_text("999999999", encoding="utf-8")
+    assert start_mod._supervisor_running() is False
+    # 当前进程（psutil 存在时应为 True）
+    pytest.importorskip("psutil")
+    (tmp_path / "supervisor.pid").write_text(str(os.getpid()), encoding="utf-8")
+    assert start_mod._supervisor_running() is True
+
+
+def argparse_namespace(start_mod, **kw):
+    import argparse
+    return argparse.Namespace(**kw)

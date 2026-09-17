@@ -788,8 +788,13 @@ class DataGateway:
     def list_cached(self, asset: AssetType | str | None = None) -> dict:
         """列出当前缓存中已落库的标的及其区间/来源。
 
-        返回 ``{symbol: {"min": date, "max": date, "rows": int, "source": str}}``，
+        返回 ``{symbol: {"min": date, "max": date, "rows": int, "demo_rows": int, "source": str}}``，
         便于运维与离线回测前确认数据覆盖情况。``asset`` 指定时只返回该资产类别的标的。
+
+        ``rows`` 是表内总行数；``demo_rows`` 单独标记其中演示(假)数据的行数——
+        历史版本（R17 之前）会把 demo 写进缓存，残留行会让 /api/cache 把假数据
+        误当真实统计。``real_rows = rows - demo_rows``。可用 ``purge_demo_cache()``
+        清洗残留。
 
         查询失败（如表不存在）时返回空 dict 而非抛错，保证内省本身不阻断主流程。
         """
@@ -803,11 +808,35 @@ class DataGateway:
             tables = ("bars", "option_bars")
         out: dict = {}
         for table in tables:
-            for sym, dmin, dmax, src in self._query_all(
-                f"SELECT symbol, MIN(date), MAX(date), MAX(source) FROM {table} GROUP BY symbol"
+            # source 只描述**真实数据**的来源：混合行时 MAX(source) 会按字母序
+            # 取到 "demo"（d > a），把假数据冒充成来源——这正是要修的统计混淆。
+            for sym, dmin, dmax, src, demo_n in self._query_all(
+                f"SELECT symbol, MIN(date), MAX(date), "
+                f"MAX(CASE WHEN source='demo' THEN NULL ELSE source END), "
+                f"SUM(CASE WHEN source='demo' THEN 1 ELSE 0 END) "
+                f"FROM {table} GROUP BY symbol"
             ):
                 out[sym] = {"min": dmin, "max": dmax, "rows": self._count(table, sym),
+                            "demo_rows": int(demo_n or 0),
                             "source": src or "unknown"}
+        return out
+
+    def purge_demo_cache(self) -> dict:
+        """清除缓存中残留的演示(假)数据行，返回各表删除行数。
+
+        新代码已从源头拦截 demo 落库（``fetch`` 对 ``src=="demo"`` 不写缓存，
+        ``_cache_get`` 命中 demo 即当作未命中）；本方法用于清洗**历史版本**
+        写入的残留行，避免 /api/cache 统计把假数据当真实数据。
+        """
+        out: dict = {}
+        for table in ("bars", "option_bars"):
+            try:
+                with self._connect() as con:
+                    cur = con.execute(f"DELETE FROM {table} WHERE source='demo'")
+                    out[table] = int(cur.rowcount or 0)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("purge_demo_cache %s 失败: %s", table, exc)
+                out[table] = 0
         return out
 
     def _query_all(self, sql: str):

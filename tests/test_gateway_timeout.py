@@ -46,6 +46,7 @@ def test_hanging_source_times_out_instead_of_blocking(gw):
         return _ohlc()
 
     gw._from_akshare = hang
+    gw._from_tencent = hang  # R17 腾讯兜底：联网沙箱会真返回，必须一并钉死才走到降级
     gw._from_baostock = hang
     t0 = time.monotonic()
     try:
@@ -72,6 +73,7 @@ def test_timeout_reason_is_observable(gw):
         return _ohlc()
 
     gw._from_akshare = hang
+    gw._from_tencent = hang  # 同上：腾讯兜底必须钉死，保证超时原因可测
     gw._from_baostock = hang
     try:
         gw.fetch("600000.SH", "2024-01-01", "2024-01-10", asset="stock",
@@ -93,6 +95,7 @@ def test_source_exception_type_is_recorded(gw):
         raise ConnectionError("dns lookup failed")
 
     gw._from_akshare = boom
+    gw._from_tencent = boom  # 腾讯兜底钉死，保证降级确实发生、失败原因可观测
     gw._from_baostock = boom
     gw.fetch("600000.SH", "2024-01-01", "2024-01-10", asset="stock",
              timeout=5, retries=0, backoff=0)
@@ -125,12 +128,18 @@ def test_timeout_is_not_retried_into_a_request_storm(gw):
         release.wait(120)
         return _ohlc()
 
+    def tx_source(symbol, start, end, asset=None):
+        calls.append("tx")
+        release.wait(120)
+        return _ohlc()
+
     def bs_source(symbol, start, end, asset=None):
         calls.append("bs")
         release.wait(120)
         return _ohlc()
 
     gw._from_akshare = ak_source
+    gw._from_tencent = tx_source
     gw._from_baostock = bs_source
     try:
         gw.fetch("600000.SH", "2024-01-01", "2024-01-10", asset="stock",
@@ -138,9 +147,10 @@ def test_timeout_is_not_retried_into_a_request_storm(gw):
     finally:
         release.set()
 
-    # akshare 1 次 + baostock 1 次；retries=3 不得把它放大成 (3+1)*2=8 次。
+    # akshare 1 次 + 腾讯 1 次 + baostock 1 次（R17 起链条为 ak→tx→bs）；
+    # retries=3 不得把它放大成 (3+1)*3=12 次。
     # 只断言请求次数：它是确定性的，不像墙钟耗时那样在满载的全量测试里飘。
-    assert calls == ["ak", "bs"], f"卡死源被重试放大为 {calls}"
+    assert calls == ["ak", "tx", "bs"], f"卡死源被重试放大为 {calls}"
     assert gw.last_was_demo
 
 
@@ -159,17 +169,23 @@ def test_hung_source_is_skipped_until_it_actually_returns(gw):
         release.wait(120)
         return _ohlc()
 
+    def tx_source(symbol, start, end, asset=None):
+        calls.append("tx")
+        release.wait(120)
+        return _ohlc()
+
     def bs_source(symbol, start, end, asset=None):
         calls.append("bs")
         release.wait(120)
         return _ohlc()
 
     gw._from_akshare = ak_source
+    gw._from_tencent = tx_source
     gw._from_baostock = bs_source
     try:
         gw.fetch("600000.SH", "2024-01-01", "2024-01-10", asset="stock",
                  timeout=0.3, retries=0, backoff=0)
-        assert calls == ["ak", "bs"]
+        assert calls == ["ak", "tx", "bs"]
 
         # 第二次 fetch：两个源都还卡着 -> 一次新请求都不该发，且要立即降级。
         # 故意把 timeout 放大到 5s：守卫生效则几乎零耗时，失效则要等满两个 5s，
@@ -177,7 +193,7 @@ def test_hung_source_is_skipped_until_it_actually_returns(gw):
         t0 = time.monotonic()
         gw.fetch("600000.SH", "2024-01-01", "2024-01-10", asset="stock",
                  timeout=5, retries=0, backoff=0, force_refresh=True)
-        assert calls == ["ak", "bs"], "卡死期间不应再对该源发起新请求"
+        assert calls == ["ak", "tx", "bs"], "卡死期间不应再对该源发起新请求"
         assert time.monotonic() - t0 < 2, "在途守卫应当立即降级而不是再等一个 timeout"
         assert gw.last_was_demo
         assert any("仍未返回" in w for w in gw.last_warnings())

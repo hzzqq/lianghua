@@ -24,10 +24,13 @@ def gw():
 
 @pytest.fixture(autouse=True)
 def offline_spot(monkeypatch):
-    """把 AKShare 实时快照接口钉成"不可用"，强制走降级分支且不发任何网络请求。
+    """把 AKShare 实时快照与腾讯实时兜底都钉成"不可用"，强制走降级分支且不发任何网络请求。
 
     live_quote 内部是 `import akshare as ak` 的惰性导入，所以这里直接改
     sys.modules 里的 akshare（没装则塞一个假模块），monkeypatch 会在用例结束后还原。
+    R17 给 live_quote 加了腾讯实时快照兜底（`tencent.fetch_quote`）：只禁 AKShare 时，
+    联网沙箱里三条降级用例会拿到 source=tencent 直接变红（实测）——本模块的契约是
+    "与网络隔离"，因此两条实时源都必须钉死。
     """
     def _down(*_a, **_k):
         raise RuntimeError("offline: 实时行情接口在测试中被禁用")
@@ -38,6 +41,8 @@ def offline_spot(monkeypatch):
         monkeypatch.setitem(sys.modules, "akshare", ak)
     monkeypatch.setattr(ak, "stock_zh_a_spot_em", _down, raising=False)
     monkeypatch.setattr(ak, "fund_etf_spot_em", _down, raising=False)
+    import lianghua.data.tencent as _tx
+    monkeypatch.setattr(_tx, "fetch_quote", _down, raising=False)
 
 
 def _df_with_source(source: str):

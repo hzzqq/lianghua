@@ -222,10 +222,13 @@ print(payoff_curve(legs, 80, 120))
 - 其他：`regime`(波动率区制) / `ml_signal`(ML 信号) / `vectorized`(向量化回测对齐修复)。
 
 ### 5. 一键启动文件
-- `start.py`：`python start.py [--port 8501] [--host 127.0.0.1] [--no-browser]`
+- `start.py`：`python start.py [--port 8501] [--host 127.0.0.1] [--no-browser] [--daemon] [--supervisor]`
   - 默认只监听本机；需要局域网内其它设备访问时显式加 `--host 0.0.0.0`。
   - 会自动挑选一个真正装了 streamlit 的解释器（当前 python → 项目 venv → PATH），
     找不到解释器或端口被占用时给出明确提示而不是报 `No module named streamlit`。
+  - `--supervisor`：守护自愈模式（R18）——经 `tools/terminal_supervisor.py` 启动，
+    终端崩溃 2s 内自动重启；加 `--daemon` 即后台守护（双击场景推荐，supervisor 日志在
+    `logs/supervisor.log`）。停止仍走「停止量化终端.bat」（先杀 supervisor 再杀终端）。
 - `run.bat` / `run.sh`：Windows / Git Bash / Linux / macOS 双击或命令行启动（转调 `start.py`，可透传参数）
   - 可用环境变量 `LIANGHUA_PYTHON=<解释器路径>` 指定解释器。
 - `启动量化终端.bat`：中文名双击入口，内部转调 `run.bat --daemon`（后台守护模式：服务脱离本窗口独立运行，
@@ -561,7 +564,13 @@ print(payoff_curve(legs, 80, 120))
 
 - 预热为默认行为（`--no-warm` 关闭）；`--live-poll N` 秒级刷新实时报价；
   `--timeout` 控制死源降级等待（断网时快速降级而非卡死）。
+- **安全加固（R18）**：默认只监听 `127.0.0.1`（确需局域网再显式 `--host 0.0.0.0`）；
+  `--token <令牌>`（或环境变量 `LIANGHUA_BACKEND_TOKEN`）启用轻量鉴权——除 `/api/health`
+  心跳外全部端点要求请求头 `X-Api-Token` 或查询参数 `?token=`（SSE 走查询参数），
+  终端侧读取同名环境变量自动携带；`--read-only` 禁用 `/api/refresh`（唯一会写缓存的端点）。
 - **降级诚实可观测**：演示数据一律标 `source=demo` / `was_demo=true`，绝不冒充真实行情。
+  `/api/cache` 每个标的额外报告 `demo_rows`（演示行数，历史版本残留），`source` 只描述真实数据来源；
+  网关侧 `purge_demo_cache()` 可清洗残留。
 - `backend/watchlist.json`：8 个预热标的，显式声明 `asset` 类型（ETF 标 `fund` 走 `fund_etf_hist_em`，避免误判降级）。
 - 启动：`python backend/data_server.py --live-poll 30`（端口 8600）；或 `backend/start_data_backend.bat|.sh`。
 

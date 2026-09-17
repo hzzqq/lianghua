@@ -4,10 +4,12 @@
 一键启动多资产量化终端（Streamlit）。会自动挑选一个装有 streamlit 的 Python 解释器。
 
 用法：
-    python start.py                 # 默认 http://localhost:8501（仅本机可访问）
-    python start.py --port 9000     # 指定端口
-    python start.py --no-browser    # 无头模式（服务器部署）
-    python start.py --host 0.0.0.0  # 允许局域网内其它设备访问
+    python start.py                    # 默认 http://localhost:8501（仅本机可访问）
+    python start.py --port 9000        # 指定端口
+    python start.py --no-browser       # 无头模式（服务器部署）
+    python start.py --host 0.0.0.0     # 允许局域网内其它设备访问
+    python start.py --supervisor       # 守护自愈模式：终端崩溃 2s 自动重启
+    python start.py --supervisor --daemon   # 守护自愈 + 后台脱离控制台（双击场景推荐）
 
 提示：如使用本机虚拟环境，请先激活（如 venv 的 Scripts/activate），
 或直接使用虚拟环境的 python 运行本脚本。
@@ -21,6 +23,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import threading
 import time
 import json
 
@@ -150,6 +153,96 @@ def _open_browser(url: str) -> None:
         pass
 
 
+# ---- 守护自愈模式（--supervisor）：转调 tools/terminal_supervisor.py， ----
+# ---- streamlit 崩溃后 2s 自动重启；停止仍走「停止量化终端.bat」（先杀 supervisor）。 ----
+
+def _supervisor_cmd_env(py: str, args) -> tuple[list[str], dict]:
+    """构造 supervisor 启动命令与环境变量（端口/地址经 env 透传给 supervisor）。"""
+    cmd = [py, os.path.join(ROOT, "tools", "terminal_supervisor.py")]
+    env = {**os.environ,
+           "LH_TERMINAL_PORT": str(args.port),
+           "LH_TERMINAL_HOST": args.host}
+    return cmd, env
+
+
+def _supervisor_running() -> bool:
+    """supervisor.pid 指向的进程是否仍在运行（psutil 可选；缺失时交由端口检查兜底）。"""
+    try:
+        with open(os.path.join(ROOT, "supervisor.pid"), encoding="utf-8") as f:
+            pid = int(f.read().strip())
+    except (OSError, ValueError):
+        return False
+    try:
+        import psutil  # 可选依赖（与 terminal.lock 同一取舍）
+    except ImportError:
+        return False
+    try:
+        return psutil.Process(pid).is_running()
+    except Exception:
+        return False
+
+
+def _start_supervised(py: str, args) -> int:
+    """以守护自愈模式启动终端。
+
+    - 默认前台：supervisor 占住当前控制台，Ctrl+C 连同子进程一起退出；
+    - 加 --daemon：supervisor 以脱离控制台的独立进程运行，关闭窗口不影响服务，
+      端口就绪后自动打开浏览器（双击场景推荐）。
+    """
+    cmd, env = _supervisor_cmd_env(py, args)
+    url = f"http://localhost:{args.port}"
+    if args.daemon:
+        log_dir = os.path.join(ROOT, "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        logf = open(os.path.join(log_dir, "supervisor.log"), "a",
+                    encoding="utf-8", errors="replace")
+        kwargs: dict = {"stdin": subprocess.DEVNULL, "stdout": logf, "stderr": logf}
+        if os.name == "nt":
+            kwargs["creationflags"] = (
+                subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
+            )
+        else:
+            kwargs["start_new_session"] = True
+        try:
+            proc = subprocess.Popen(cmd, env=env, **kwargs)
+        except Exception as e:
+            print(f"[错误] 守护进程拉起失败: {e}")
+            return 1
+        print(f"🚀 量化终端已进入守护自愈模式 (supervisor PID {proc.pid})")
+        print(f"   地址: {url}")
+        print(f"   日志: logs/supervisor.log")
+        print(f"   终端崩溃会由 supervisor 在 2s 内自动重启；停止请运行「停止量化终端.bat」。")
+        deadline = time.time() + 20
+        while time.time() < deadline:
+            if _port_in_use(args.host, args.port):
+                _open_browser(url)
+                break
+            time.sleep(0.5)
+        else:
+            print(f"[警告] 20 秒内端口 {args.port} 未就绪，请查看 logs/supervisor.log。")
+        return 0
+
+    print(f"🚀 以守护自愈模式启动量化终端 → {url}")
+    print(f"   终端崩溃会由 supervisor 在 2s 内自动重启；停止请运行「停止量化终端.bat」。")
+    threading.Thread(
+        target=_open_when_port_ready, args=(args.host, args.port, url), daemon=True,
+    ).start()
+    try:
+        return subprocess.run(cmd, env=env).returncode
+    except KeyboardInterrupt:
+        print("\n已停止。")
+        return 0
+
+
+def _open_when_port_ready(host: str, port: int, url: str, timeout: float = 20.0) -> None:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if _port_in_use(host, port):
+            _open_browser(url)
+            return
+        time.sleep(0.5)
+
+
 def _start_daemon(py: str, args) -> int:
     """后台（守护）模式：启动一个脱离当前控制台的 Streamlit 独立进程。
 
@@ -272,11 +365,21 @@ def main() -> int:
     p.add_argument("--no-browser", action="store_true", help="无头模式，不尝试打开浏览器")
     p.add_argument("--daemon", action="store_true",
                    help="后台模式：以脱离控制台的独立进程运行，关闭命令行窗口不影响服务")
+    p.add_argument("--supervisor", action="store_true",
+                   help="守护自愈模式：经 tools/terminal_supervisor.py 启动，终端崩溃 2s 自动重启"
+                        "（可与 --daemon 组合为后台守护；停止仍走「停止量化终端.bat」）")
     args = p.parse_args()
 
     if not os.path.exists(APP):
         print(f"[错误] 找不到 UI 入口: {APP}")
         return 1
+
+    # 守护自愈模式已在运行：直接复用，不重复拉起（supervisor 会自愈，无需干预）
+    if args.supervisor and _supervisor_running():
+        url = f"http://localhost:{args.port}"
+        print(f"[提示] 量化终端已处于守护自愈模式运行 → {url}")
+        _open_browser(url)
+        return 0
 
     py = _resolve_python()
     if py is None:
@@ -304,6 +407,9 @@ def main() -> int:
         print(f"  · 想知道是谁占用：在 PowerShell 运行")
         print(f"      Get-NetTCPConnection -LocalPort {args.port} -State Listen | Select-Object OwningProcess")
         return 1
+
+    if args.supervisor:
+        return _start_supervised(py, args)
 
     if args.daemon:
         return _start_daemon(py, args)
