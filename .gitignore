@@ -8,13 +8,9 @@ rebalance_log.json
 data_cache.db
 *.pyc
 __pycache__/
-*.pyc
-__pycache__/
+# pytest 运行产物（缓存 + basetemp 临时目录，测试生成，非源码）
 .pytest_cache/
-# pytest 临时/运行产物（测试生成，非源码）
-.pytest_tmp/
-.pytest_tmp2/
-.pytest_tmp3/
+.pytest_*/
 nul
 .workbuddy/
 

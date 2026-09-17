@@ -48,9 +48,12 @@ def test_sortino_and_calmar():
     assert np.isfinite(s)
     c = calmar(eq)
     assert np.isfinite(c)
-    # 无下行时 Omega 应为 inf（基准已处理）
+    # 平坦序列无上行无下行：无信息，返回 0 避免 inf 污染下游（perf/sortino.py 有意如此）
     flat = pd.Series([100.0] * 50)
-    assert omega_ratio(flat) == pytest.approx(np.inf)
+    assert omega_ratio(flat) == 0.0
+    # 无下行但有上行：理论无穷（完美）
+    rising = pd.Series(np.linspace(100.0, 150.0, 50))
+    assert omega_ratio(rising) == pytest.approx(np.inf)
 
 
 def test_ratios_finite_on_normal_equity():
