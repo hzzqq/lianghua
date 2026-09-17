@@ -14,6 +14,7 @@ import logging
 import os
 import sqlite3
 import threading
+import time
 from contextlib import contextmanager
 
 import numpy as np
@@ -34,6 +35,20 @@ class DataGateway:
     OPTION_COLUMNS = ["date", "underlying", "option_price", "delta", "gamma",
                       "vega", "theta", "rho", "strike", "expiry", "type"]
 
+    # ---- 源级失败冷却（熔断，R19）----
+    # 断网/被墙时 AKShare/腾讯会「立即抛错」（ProxyError/DNS/501，毫秒级），
+    # 每次 fetch 都把整条源链快速失败跑一遍（含重试），单符号 ~11s，冷启动首屏空窗。
+    # 冷却：同一源连续「快速失败」达到阈值后，短时间内直接跳过（指数退避，封顶）。
+    # 边界（务必守住）：
+    # - 只针对快速失败；**超时类失败不进冷却**（由 _with_timeout 的在途守卫自愈管理）；
+    # - 任一尝试成功即清零；CSV/缓存路径不经过熔断；
+    # - 冷却对 force_refresh 同样生效（与在途守卫一致：保护性闸门不被调用方标志绕过；
+    #   冷却基数仅 30s 且源线程一旦正常完成即清零，手动刷新最多等一个冷却周期）；
+    # - 跳过行为记入 _last_errors，可观测。
+    COOLDOWN_AFTER_FAST_FAILS = 2     # 连续快速失败 N 次后进入冷却
+    COOLDOWN_BASE_SECONDS = 30.0      # 冷却基数（指数退避起点）
+    COOLDOWN_MAX_SECONDS = 300.0      # 冷却封顶
+
     def __init__(self, cache_db: str | os.PathLike = CACHE_DB,
                  csv_dir: str | os.PathLike | None = None):
         self.cache_db = str(cache_db)
@@ -47,6 +62,10 @@ class DataGateway:
         # 用于阻止对已卡死的源继续放大请求，详见 _with_timeout / _abandoned_alive。
         self._abandoned: dict[str, list[threading.Thread]] = {}
         self._abandoned_lock = threading.Lock()
+        # 源级失败冷却状态（R19）：name -> 连续快速失败次数 / 冷却截止时刻
+        self._fail_streak: dict[str, int] = {}
+        self._cooldown_until: dict[str, float] = {}
+        self._cooldown_lock = threading.Lock()
         self._init_cache()
 
     # ---------- 缓存 ----------
@@ -570,6 +589,8 @@ class DataGateway:
             每次间隔 ``backoff`` 秒（默认不重试、间隔 0，便于单测；线上可调大以扛瞬时抖动）。
             仅对"真实源"重试——缓存/CSV 命中与最终演示降级不重试。
         force_refresh: 为 True 时跳过缓存强制重新拉取（用于刷新/更新数据）。
+            注意：源级失败冷却（R19）对 force_refresh 同样生效——保护性闸门不被
+            调用方标志绕过；冷却基数仅 30s 且源恢复即清零，手动刷新最多等一个周期。
         缓存仅在**完整覆盖**请求区间时才命中，避免部分缓存返回不完整数据。
 
         降级可观测：最终落到演示（假）数据时，会在日志打 warning 并把失败原因记入
@@ -651,7 +672,18 @@ class DataGateway:
 
         真实源可能因瞬时网络抖动/接口限流而偶发失败，重试可显著减少不必要的假数据降级。
         每次失败原因都记入 ``_last_errors``，便于排障；``backoff`` 控制重试间隔（秒）。
+
+        冷却熔断（R19）：该源处于冷却期（连续快速失败达阈值）时直接跳过不发网络请求
+        并留痕；对 force_refresh 同样生效（与在途守卫一致的保护性闸门）。
         """
+        name = getattr(fn, "__name__", str(fn))
+        if self._source_cooling(name):
+            self._last_errors.append(
+                f"{name}: 连续快速失败 {self._fail_streak.get(name, 0)} 次，"
+                f"冷却中本次直接跳过（冷却到期或源恢复后自动重试）")
+            if len(self._last_errors) > 20:
+                self._last_errors = self._last_errors[-20:]
+            return None
         attempts = max(1, int(retries) + 1)
         last_exc: Exception | None = None
         for i in range(attempts):
@@ -659,24 +691,47 @@ class DataGateway:
                 res = self._with_timeout(fn, timeout, *args)
                 if res is not None and not (isinstance(res, pd.DataFrame) and res.empty):
                     # 成功：清掉本次尝试前累计的瞬时失败记录，避免陈旧原因误导
+                    # （冷却状态已在 _with_timeout 内按「线程正常完成」清零）
                     self._last_errors = [m for m in self._last_errors
                                           if not m.startswith(getattr(fn, "__name__", ""))]
                     return res
             except Exception as exc:  # noqa: BLE001
                 last_exc = exc
             if i < attempts - 1 and backoff > 0:
-                import time
                 time.sleep(backoff)
         if last_exc is not None:
             self._last_errors.append(
-                f"{getattr(fn, '__name__', fn)}: 重试{attempts - 1}次仍失败: {type(last_exc).__name__}: {last_exc}"
+                f"{name}: 重试{attempts - 1}次仍失败: {type(last_exc).__name__}: {last_exc}"
             )
         else:
-            # 真实源未抛异常但返回空（如依赖未安装/接口返回空），同样记录以便降级告警
+            # 真实源未抛异常但返回空（如依赖未安装/接口返回空/在途守卫/超时放弃）：
+            # 不计冷却——空数据不代表源死亡，超时类由在途守卫自愈管理。
             self._last_errors.append(
-                f"{getattr(fn, '__name__', fn)}: 重试{attempts - 1}次仍无有效数据"
+                f"{name}: 重试{attempts - 1}次仍无有效数据"
             )
         return None
+
+    # ---------- 源级失败冷却（熔断，R19） ----------
+    def _source_cooling(self, name: str) -> bool:
+        """该源是否处于冷却期（连续快速失败达阈值后，指数退避到期前）。"""
+        with self._cooldown_lock:
+            return self._cooldown_until.get(name, 0.0) > time.monotonic()
+
+    def _record_source_success(self, name: str) -> None:
+        """任一尝试成功：清零失败连击并解除冷却。"""
+        with self._cooldown_lock:
+            self._fail_streak[name] = 0
+            self._cooldown_until.pop(name, None)
+
+    def _record_source_fast_fail(self, name: str) -> None:
+        """快速失败（源线程真实抛错、未触发超时）计数；达阈值后进入指数退避冷却。"""
+        with self._cooldown_lock:
+            n = self._fail_streak.get(name, 0) + 1
+            self._fail_streak[name] = n
+            if n >= self.COOLDOWN_AFTER_FAST_FAILS:
+                cd = min(self.COOLDOWN_BASE_SECONDS * (2 ** (n - self.COOLDOWN_AFTER_FAST_FAILS)),
+                         self.COOLDOWN_MAX_SECONDS)
+                self._cooldown_until[name] = time.monotonic() + cd
 
     def _note_error(self, fn, exc: BaseException) -> None:
         """记录一次真实源失败原因（保留最近 20 条，供 UI/排障读取）。"""
@@ -733,8 +788,13 @@ class DataGateway:
             self._note_error(fn, TimeoutError(f"超过 {timeout}s 未返回，已放弃本次取数"))
             return None
         if "error" in box:
+            # 源线程真实抛错（请求已返回，未触发超时）= 快速失败：计入冷却熔断（R19）。
+            # 超时/在途守卫路径不记录——那两类由在途守卫自愈管理，与本熔断互补。
+            self._record_source_fast_fail(name)
             self._note_error(fn, box["error"])
             return None
+        # 线程正常完成（无论有没有拿到数据）：源是活的，清零失败连击并解除冷却
+        self._record_source_success(name)
         return box.get("value")
 
     def _abandoned_alive(self, name: str) -> int:

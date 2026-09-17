@@ -243,6 +243,10 @@ def test_live_quote(monkeypatch):
     from lianghua.data.gateway import DataGateway
 
     _offline_akshare(monkeypatch)
+    # R17 起 live_quote 有腾讯实时快照兜底：联网沙箱会真返回 tencent 而走不到降级分支，
+    # 必须一并钉死（网络隔离纪律，rules.md §7）
+    import lianghua.data.tencent as _tx
+    monkeypatch.setattr(_tx, "fetch_quote", lambda *a, **k: None, raising=False)
     gw = DataGateway(cache_db=":memory:")
     gw.fetch = lambda *a, **k: pd.DataFrame({
         "date": ["2024-01-02"], "open": [100.0], "high": [101.0],

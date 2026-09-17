@@ -239,6 +239,32 @@ def _http_get_status(url, timeout=2):
         return 0
 
 
+def cache_health_summary(cache: dict | None) -> dict:
+    """把 /api/cache 的 ``{symbol: {rows, demo_rows, source, ...}}`` 汇总成数据健康摘要。
+
+    行级真实/演示分离（R18 起 ``list_cached`` 返回 ``demo_rows``）：
+    - ``real_rows = rows - demo_rows``；旧字段缺失时 demo_rows 视为 0；
+    - ``polluted``：混有演示残留的标的（真实行 + demo 行并存）；
+    - ``demo_symbols``：整只标的全是演示行的（历史版本残留的典型形态）。
+    纯函数，便于无头测试。
+    """
+    out = {"symbols": 0, "real_rows": 0, "demo_rows": 0,
+           "polluted": [], "demo_symbols": []}
+    for sym, v in (cache or {}).items():
+        if not isinstance(v, dict):
+            continue
+        out["symbols"] += 1
+        rows = int(v.get("rows") or 0)
+        demo = max(0, min(int(v.get("demo_rows") or 0), rows))
+        out["real_rows"] += rows - demo
+        out["demo_rows"] += demo
+        if rows > 0 and demo == rows:
+            out["demo_symbols"].append(sym)
+        elif demo > 0:
+            out["polluted"].append(sym)
+    return out
+
+
 def backend_online() -> bool:
     """探测真实行情后端是否存活。
 
@@ -995,21 +1021,34 @@ def page_html():
 
 # ---------------- 两行图辅助 ----------------
 def make_2row(s1, s2, name1, name2, bar2=True):
+    """上：主序列折线（按首尾方向红涨绿跌着色 + 渐变填充）；下：次序列（柱=按逐柱涨跌
+    方向着色，线=单色）。任一序列为空/全 NaN 时优雅降级为空态提示，不再裸渲染空白坐标轴。
+    """
     from plotly.subplots import make_subplots
+    s1 = pd.Series(s1) if s1 is not None else pd.Series(dtype=float)
+    s2 = pd.Series(s2) if s2 is not None else pd.Series(dtype=float)
+    s1_num = pd.to_numeric(s1, errors="coerce")
+    if len(s1_num) == 0 or not np.isfinite(s1_num).any():
+        return empty_figure("暂无可绘制数据")
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
                         row_heights=[0.6, 0.4], vertical_spacing=0.04)
-    s1v = np.asarray(s1.values, dtype=float)
-    up = bool(s1v[-1] >= s1v[0]) if len(s1v) else True
+    up = bool(s1_num.iloc[-1] >= s1_num.iloc[0])
     c1 = RED if up else GREEN
     fill1 = "rgba(255,77,79,0.10)" if up else "rgba(0,212,134,0.10)"
-    fig.add_trace(go.Scatter(x=s1.index, y=s1.values, name=name1,
+    fig.add_trace(go.Scatter(x=s1.index, y=s1_num.values, name=name1,
                              line=dict(color=c1, width=2),
                              fill="tozeroy", fillcolor=fill1), row=1, col=1)
-    if bar2:
-        fig.add_trace(go.Bar(x=s2.index, y=s2.values, name=name2,
-                             marker_color="#8898ff"), row=2, col=1)
-    else:
-        fig.add_trace(go.Scatter(x=s2.index, y=s2.values, name=name2,
+    s2_num = pd.to_numeric(s2, errors="coerce")
+    has_s2 = len(s2_num) > 0 and np.isfinite(s2_num).any()
+    if has_s2 and bar2:
+        # 柱按「逐柱相对前值」方向着色：涨红/跌绿（A 股语义），首柱默认红
+        vals = s2_num.fillna(0.0).values
+        colors = [RED if (i == 0 or vals[i] >= vals[i - 1]) else GREEN
+                  for i in range(len(vals))]
+        fig.add_trace(go.Bar(x=s2.index, y=vals, name=name2,
+                             marker_color=colors), row=2, col=1)
+    elif has_s2:
+        fig.add_trace(go.Scatter(x=s2.index, y=s2_num.values, name=name2,
                                  line=dict(color=GREEN)), row=2, col=1)
     fig.update_layout(height=520, template="plotly_dark",
                       margin=dict(l=20, r=20, t=20, b=20))
@@ -1918,24 +1957,37 @@ def page_home():
     theme.tip("离线环境下数据网关会自动降级为演示(假)数据，页面会明确提示；"
               "以此跑出的回测仅供功能验证，不代表真实行情。")
 
-    # —— 数据健康（迭代：缓存真实 vs 演示覆盖）——
+    # —— 数据健康（行级真实 vs 演示分离 + 一键清洗，R19）——
     if _online:
         try:
             _cache = _http_get_json(f"{DATA_BACKEND_BASE}/api/cache", timeout=3)
             if isinstance(_cache, dict) and _cache:
-                _real = sum(1 for v in _cache.values()
-                            if str(v.get("source")) not in ("demo", "none", ""))
-                _demo = len(_cache) - _real
+                _h = cache_health_summary(_cache)
                 theme.section_header("数据健康", "本地缓存覆盖（离线回测也可信）", icon="🩺")
                 theme.kpi_grid([
-                    {"label": "缓存标的数", "value": len(_cache), "color": ACCENT},
-                    {"label": "真实数据", "value": _real, "color": "#00d486"},
-                    {"label": "演示降级", "value": _demo, "color": "#ff4d4f" if _demo else ACCENT},
-                ], columns=3)
-                _sample = "; ".join(
-                    f"{s}({v.get('rows')}行,{v.get('source')})"
-                    for s, v in list(_cache.items())[:6])
-                theme.tip(f"样本：{_sample}{' …' if len(_cache) > 6 else ''}")
+                    {"label": "缓存标的数", "value": _h["symbols"], "color": ACCENT},
+                    {"label": "真实行数", "value": _h["real_rows"], "color": "#00d486"},
+                    {"label": "演示残留行数", "value": _h["demo_rows"],
+                     "color": "#ff4d4f" if _h["demo_rows"] else ACCENT},
+                    {"label": "含残留标的", "value": len(_h["polluted"]) + len(_h["demo_symbols"]),
+                     "color": "#ff4d4f" if (_h["polluted"] or _h["demo_symbols"]) else ACCENT},
+                ], columns=4)
+                if _h["demo_symbols"] or _h["polluted"]:
+                    _bad = "; ".join(_h["demo_symbols"][:4]
+                                     + [f"{s}(混有残留)" for s in _h["polluted"][:4]])
+                    theme.tip(f"⚠️ 演示(假)数据残留：{_bad}。演示行不会被复用（命中即弃），"
+                              f"但会污染缓存统计，可一键清洗。")
+                    if st.button("🧹 清洗演示残留行", key="home_purge_demo",
+                                 use_container_width=True):
+                        from lianghua.data.gateway import DataGateway
+                        _purged = DataGateway().purge_demo_cache()
+                        st.success(f"已清除演示残留：bars {_purged.get('bars', 0)} 行 / "
+                                   f"option_bars {_purged.get('option_bars', 0)} 行")
+                else:
+                    _sample = "; ".join(
+                        f"{s}({v.get('rows')}行,{v.get('source')})"
+                        for s, v in list(_cache.items())[:6])
+                    theme.tip(f"样本：{_sample}{' …' if len(_cache) > 6 else ''}")
         except Exception:
             pass
 

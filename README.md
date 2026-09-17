@@ -459,7 +459,10 @@ print(payoff_curve(legs, 80, 120))
 ## 第二轮扩展能力（本轮交付）
 
 ### 1. 多源数据接入（真实数据可接）
-- `data/gateway.py` 优先级：**本地缓存 → CSV → AKShare → BaoStock → 演示数据**
+- `data/gateway.py` 优先级：**本地缓存 → CSV → AKShare → 腾讯（R17）→ BaoStock → 演示数据**
+- **源级失败冷却（R19）**：连续「快速失败」（立即抛错，如断网 ProxyError）达 2 次的源进入
+  指数退避冷却（30s 起、300s 封顶），冷却期内直接跳过（含 `force_refresh`，与在途守卫一致）；
+  超时类失败不进冷却（由在途守卫自愈）。断网时不再每个符号都把整条源链跑一遍（单符号 ~11s → 毫秒级跳过）
 - AKShare 已对接四类资产：股票 `stock_zh_a_hist`、基金 `fund_open_fund_info_em`、期货 `futures_main_sina`、期权 `option_sse_daily_sina`（真实期权日线）+ `fund_etf_hist_em`（真实标的 ETF 锚定 + BS 模型生成期权价/Greeks，详见第五轮）
 - BaoStock 适配（A 股）；断网/缺包自动回退演示数据，离线可跑
 - 期权希腊字母落 `option_bars` 缓存表，二次拉取免重算（28ms→3ms）
